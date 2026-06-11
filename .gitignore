@@ -1,0 +1,32 @@
+# Android / Gradle
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+build/
+app/build/
+app/.cxx/
+!gradle-wrapper.jar
+*.log
+
+# Local music & analysis artifacts (never ship audio)
+/mixes/
+analysis/debug_tracks/
+analysis/reports/
+venv/
+__pycache__/
+*.pyc
+
+# Throwaway screenshots
+screen*.png
+
+# Glyph Matrix SDK — fetched by scripts/fetch_glyph_sdk.sh, never committed
+app/libs/*.aar
+
+# Personal tooling, not for the public tree
+scripts/download_nebula_breeze.sh

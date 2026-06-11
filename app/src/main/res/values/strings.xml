@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">Le FLAC</string>
+    <string name="glyph_toy_desc">Controls the LE FLAC glyph deck</string>
+    <string name="toy_name">LE FLAC</string>
+    <string name="toy_summary">LF-1 deck on the matrix — turntable, cassette, sleep clock</string>
+</resources>

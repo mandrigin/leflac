@@ -1,0 +1,26 @@
+LE FLAC (LF-1)
+Copyright 2026 Igor Mandrigin
+
+Licensed under the Apache License, Version 2.0.
+
+Not affiliated with or endorsed by Nothing Technology Limited.
+
+Third-party components:
+
+- Glyph Matrix SDK — Copyright Nothing Technology Limited. Licensed under
+  Nothing's own developer terms, which prohibit redistribution; it is NOT
+  bundled in this repository. scripts/fetch_glyph_sdk.sh downloads it from
+  the official developer kit:
+  https://github.com/Nothing-Developer-Programme/GlyphMatrix-Developer-Kit
+
+- VT323 (app/src/main/res/font/lcd_font.ttf)
+  Copyright 2011 The VT323 Project Authors (Peter Hull).
+  SIL Open Font License 1.1 — http://scripts.sil.org/OFL
+
+- Press Start 2P (app/src/main/res/font/pixel_font.ttf)
+  Copyright 2012 The Press Start 2P Project Authors (CodeMan38),
+  with Reserved Font Name "Press Start 2P".
+  SIL Open Font License 1.1 — http://scripts.sil.org/OFL
+
+- JTransforms 3.1 — BSD 2-Clause license.
+- AndroidX, Media3/ExoPlayer, Gson, Kotlin coroutines — Apache License 2.0.
