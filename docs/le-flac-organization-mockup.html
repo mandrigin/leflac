@@ -488,7 +488,7 @@
 
     .tabs {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(4, 1fr);
       border-bottom: 1px solid rgba(32, 32, 32, 0.12);
       font-size: 10px;
       font-weight: 950;
@@ -819,9 +819,10 @@
             <span>[X]</span>
           </div>
           <div class="tabs">
-            <div class="tab active">HOT NOW</div>
+            <div class="tab active">HOT</div>
             <div class="tab">MIXES</div>
             <div class="tab">ALBUMS</div>
+            <div class="tab">NEXT 02</div>
           </div>
           <div class="rows">
             <div class="row selected">
@@ -916,9 +917,10 @@
             <span>[X]</span>
           </div>
           <div class="tabs">
-            <div class="tab">HOT NOW</div>
+            <div class="tab">HOT</div>
             <div class="tab active">MIXES</div>
             <div class="tab">ALBUMS</div>
+            <div class="tab">NEXT</div>
           </div>
           <div class="rows">
             <div class="row selected">
@@ -970,7 +972,7 @@
         <div class="legend">
           <div class="legend-row"><span class="key">FACEPLATE</span><span>Now playing, analysis state, no Toy preview.</span></div>
           <div class="legend-row"><span class="key">TRANSPORT</span><span>Scrubber, time, immediate controls.</span></div>
-          <div class="legend-row"><span class="key">LEDGER</span><span>Library, mixes, albums, SCAN.</span></div>
+          <div class="legend-row"><span class="key">LEDGER</span><span>Library, mixes, albums, UP NEXT, SCAN.</span></div>
           <div class="legend-row"><span class="key">BACK PANEL</span><span>Manual, settings, DIP switches, serial.</span></div>
         </div>
       </section>
@@ -981,10 +983,12 @@
           Square buttons = immediate transport<br>
           ORDER rail = deterministic next/previous<br>
           RNG rail = smart generated future<br>
+          UP NEXT = explicit FIFO priority before either rail<br>
           Rail latch = ORDER or RNG future<br>
           Hold PREV/NEXT = force ORDER override<br>
           DIP switches = persistent settings<br>
           Ledger rows = music selection<br>
+          Hold row + tap more + QUEUE = schedule one or many<br>
           SCAN = command or filter<br>
           Glyph = system-strip state only<br>
           Orange = active/current/action<br>
@@ -1043,6 +1047,7 @@
           <li data-id="16" data-targets="faceplate transport ledger loud"><span><strong>One thing loud at a time.</strong> The current track can be expressive; the library and controls stay calmer.</span></li>
           <li data-id="17" data-targets="faceplate transport ledger color"><span><strong>Use color semantically.</strong> Orange means current/action/hot. Ink means ORDER. Cyan means RNG/analysis/deck signal. Dim means secondary but readable.</span></li>
           <li data-id="18" data-targets=""><span><strong>Preserve the back panel.</strong> Manual, DIP switches, serial, runtime, command legend, and advanced settings live on the rear.</span></li>
+          <li data-id="19" data-targets="ledger transport"><span><strong>Give explicit futures a priority bus.</strong> Hold one row, tap more, then QUEUE; the NEXT tab shows FIFO order before ORDER/RNG.</span></li>
         </ul>
       </section>
     </aside>

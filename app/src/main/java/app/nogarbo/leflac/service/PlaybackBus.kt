@@ -11,6 +11,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 object PlaybackBus {
     val spectrum = MutableStateFlow(SpectrumState())
 
+    /** Explicit FIFO segment immediately after the current timeline item. */
+    val upNext = MutableStateFlow<List<UpNextEntry>>(emptyList())
+
     /** 0..1 while a mix is playing, negative otherwise. */
     val mixProgress = MutableStateFlow(-1f)
 

@@ -9,8 +9,9 @@ LE FLAC is a local-only music player that behaves like a piece of field
 equipment: it analyses every track it touches, knows where the drops are
 before they arrive, keeps a clock on its sleep screen, prints its manual
 and its own circuit diagram on the back of the chassis, and runs a 25×25
-LED cassette deck on the Glyph Matrix. LF-1 1.1 also becomes a projected,
-browsable Android Auto media source without adding a network permission.
+LED cassette deck on the Glyph Matrix. LF-1 1.2 is also a projected, browsable
+Android Auto media source and adds a persistent, explicit UP NEXT bus without
+adding a network permission.
 
 <p align="center">
   <img src="docs/faceplate-song.png" width="300" alt="FIELD skin — a song on the deck">
@@ -41,7 +42,7 @@ had it.
 | SKINS | FIELD (chassis beige · safety orange · cyan) · POCKET (2-bit 1989-handheld LCD, Bayer-dithered, no alpha anywhere) |
 | MATRIX | 25×25 Glyph: turntable, cassette, sleeping ampelmann, punch-in shutter, plate clock |
 | ANALYSIS | full-track FFT at import · epic-segment detection · cue extraction · BPM · drive profiling |
-| MEMORY | play/skip stats with 45-day half-life · mix resume positions · lifetime runtime, etched on the chassis |
+| MEMORY | play/skip stats with 45-day half-life · persistent FIFO UP NEXT · mix resume positions · lifetime runtime, etched on the chassis |
 | CAR DECK | Android Auto browse · host voice requests · resume · steering-wheel transport · POCKET artwork by default, FIELD selectable |
 | DISPLAY DRIVER | AGSL CRT raster: scanline tear, phosphor lines, periodic magnet pass with degauss snap-back |
 | REQUIRES | Android 14+ · a Nothing Phone (3) for the Matrix · a compatible Android Auto host for the car deck |
@@ -65,7 +66,7 @@ chassis grid — every seam lands on a printed line.
 │  PREV  PLAY  NEXT  RNG [ORDER|RNG]│
 ├──────────────────────────────────┤
 │  SCAN > _                        │  LEDGER         choosing, calm
-│  HOT NOW │ MIXES │ ALBUMS        │
+│  HOT │ MIXES │ ALBUMS │ NEXT 02  │
 │  295 CHOKEHOLD ········· 05:04   │
 └──────────────────────────────────┘
 ```
@@ -101,6 +102,14 @@ back-to-back, never a mix invading a song queue. A small slide switch
 above NEXT and RNG shows which rail owns the future; holding PREV/NEXT
 forces the ORDER rail no matter what. `RNG` itself is a one-shot random
 jump — a real button, never a mode.
+
+**UP NEXT outranks both rails.** Hold a track to open the loader, tap more
+tracks in the order you want them, then press `[QUEUE]`. The `NEXT nn` ledger
+tab shows the FIFO priority bus and provides per-item remove and clear controls.
+Normal track taps still mean play now. A play-now selection starts a new
+context and clears the previous explicit schedule; changing ORDER/RNG preserves
+it. Song and mix pools remain separate. The exact behavior and edge cases are
+in [`docs/UP_NEXT.md`](docs/UP_NEXT.md).
 
 ## HOT NOW
 
@@ -188,6 +197,11 @@ preserving the unit's existing separation. Voice requests delivered by the host
 are resolved against local media; the first Honda e voice run remains a live
 acceptance check.
 
+Phone-scheduled UP NEXT items live in that same Media3 timeline, so automatic
+transitions and steering-wheel NEXT consume them before returning to ORDER/RNG.
+Hosts decide whether to expose their standard queue page; no extra car browse
+destination is required.
+
 The head unit owns its typography, chrome, and final layout. `CAR SKIN` on
 the rear panel therefore controls the parts LE FLAC is allowed to own:
 browse/now-playing artwork and content-style hints. It defaults to **POCKET**;
@@ -217,15 +231,15 @@ scripts/push_music.sh DIR   # push a folder of music to the device
 ```
 
 The exact phone-tested sideload build is attached to the
-[v1.1.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.1.0).
+[v1.2.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.2.0).
 That APK uses the development/debug signing key and is intended for direct
 testing, not store distribution. Upgrade preservation requires the installed
-copy to use the same signing key. Version 1.1.0 uses Media3 1.10.1 and API 36
+copy to use the same signing key. Version 1.2.0 uses Media3 1.10.1 and API 36
 build tooling while retaining target SDK 34 for the initial sideloaded Honda e
 validation. It needs a local
 music library (it scans MediaStore) and, for the full experience, a
 Nothing Phone (3) with the Glyph Matrix. Add LE FLAC as a Glyph Toy in
-settings; long-press is the only transport gesture, by design. The
+settings; transport and track-loader long presses are deliberate, by design. The
 design spec lives in `docs/` — the organization mockup is the drawing
 this faceplate was built from.
 

@@ -1,6 +1,6 @@
 # LE FLAC Android Auto Operator Guide
 
-This guide covers LF-1 1.1.0 on projected Android Auto, with the first live
+This guide covers LF-1 1.2.0 on projected Android Auto, with the first live
 acceptance run targeted at a Honda e. LE FLAC remains offline-only: the car
 browser reads the phone's MediaStore and the app still declares no `INTERNET`
 permission.
@@ -20,6 +20,15 @@ used by the phone UI. The car can start the service without starting
 
 Songs and mixes keep separate queues. A song selection queues songs; a mix
 selection queues mixes. Android Auto never autoplays merely because it connects.
+Tracks scheduled with the phone's long-press UP NEXT loader occupy the priority
+segment immediately after the current item. Natural completion and car NEXT
+consume that FIFO segment before returning to the selected ORDER/RNG rail. The
+host may expose it through its standard queue page; LE FLAC does not duplicate
+mutable queue state as a fifth browse destination.
+
+LF-1 does not expose ExoPlayer's native shuffle toggle to car controllers. RNG
+is a materialized smart rail, selected on the parked phone, and native shuffle
+would reorder the shared timeline around explicit UP NEXT items.
 
 ## POCKET and FIELD in the car
 
@@ -48,7 +57,7 @@ The checked-in build uses:
 
 | Component | Version |
 |---|---:|
-| App | 1.1.0 (version code 2) |
+| App | 1.2.0 (version code 3) |
 | Media3 | 1.10.1 |
 | compile SDK | 36 |
 | target SDK | 34 |
@@ -115,7 +124,13 @@ Android Auto.
 8. Browse Albums, start a song, and test play/pause, scrub, next, previous, and
    a steering-wheel command.
 9. Start a long mix and confirm next/previous remains within the mixes queue.
-10. On the parked phone, move `CAR SKIN` to FIELD and return to the car UI;
+10. While a song is playing, use the parked phone to hold one song row, tap a
+    second row, press `[QUEUE]`, and confirm the host queue (when shown)
+    lists them in that order. Steering-wheel NEXT must reach both before the
+    normal rail resumes.
+11. Switch ORDER/RNG on the phone and confirm the two explicit entries remain
+    ahead of the rebuilt rail.
+12. On the parked phone, move `CAR SKIN` to FIELD and return to the car UI;
     confirm app-owned art refreshes. Put it back to the preferred setting.
 
 Honda publishes owner manuals from its [official manuals and guides page](https://www.honda.co.uk/cars/owners/manuals-and-guides/honda-owners-manuals.html).
@@ -143,7 +158,11 @@ Run every item while parked unless it explicitly tests an interruption:
 - **Route loss:** unplugging USB or headphones triggers safe noisy-route
   handling; reconnecting does not autoplay unexpectedly.
 - **Resume:** disconnect/reconnect and process recreation retain the last item
-  and a sensible position without starting playback on connection.
+  and a sensible position without starting playback on connection; pending UP
+  NEXT IDs retain order and missing files are discarded.
+- **Priority queue:** phone long-press selection commits A then B as
+  `CURRENT → A → B → ORDER/RNG`; rail changes preserve A/B, removal and clear
+  update the car's standard queue, and a play-now selection clears the schedule.
 - **Visuals:** POCKET is the fresh-install default; FIELD is selectable; text
   and host-tinted icons remain readable in day and night modes.
 - **Existing app:** phone FIELD/POCKET behavior, smart queues, local analysis,
@@ -204,6 +223,8 @@ notifies subscribed nodes, but some OEM hosts cache artwork until navigation.
 - `AudioService` remains the single playback owner and now hosts one
   `MediaLibrarySession`. ID-only and host-delivered voice-query requests are
   resolved before they reach ExoPlayer.
+- Marked UP NEXT items live inside the ExoPlayer timeline, are published by
+  `PlaybackBus`, and are persisted as ordered MediaStore IDs for resumption.
 - Missing permission is a valid library state, not a service failure.
 - The manifest declares projected Android Auto media support only. It does not
   claim a native Android Automotive OS activity or the beta templated-media

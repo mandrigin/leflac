@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.2.0 — 2026-07-12 — Up Next priority bus
+
+- Added a long-press track loader with ordered multi-selection and an explicit
+  `[QUEUE]` commit step; normal taps remain play-now.
+- Added a fourth `NEXT nn` ledger tab with FIFO order, queued-row markers,
+  per-item removal, clear-all, empty-state guidance, haptics, and accessibility
+  labels.
+- Inserted scheduled items into the real Media3/ExoPlayer timeline ahead of
+  ORDER or RNG, so the phone, notification, and Android Auto share one queue.
+- Preserved scheduled items across rail changes, Activity recreation, service
+  resumption, and car reconnection; missing MediaStore items are discarded on
+  restore.
+- Kept the underlying rail intact so remove/clear are lossless; after a marked
+  item is consumed, its first later natural repeat is removed. Repeated
+  scheduling is idempotent.
+- Corrected phone ORDER queues and index-based transport to preserve song/mix
+  pools and honor the actual player timeline.
+- Added pure queue-planning coverage for FIFO insertion, promotion,
+  idempotency, and rail-priority merging.
+
 ## 1.1.0 — 2026-07-12 — Android Auto car deck
 
 - Replaced the playback-only Media3 session with one browsable

@@ -20,6 +20,14 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import java.io.ByteArrayOutputStream
 import app.nogarbo.leflac.R
+import app.nogarbo.leflac.service.QueuePool
+import app.nogarbo.leflac.service.ScheduleUpNextResult
+import app.nogarbo.leflac.service.UpNextQueue
+import app.nogarbo.leflac.service.insertPriorityAfterCurrent
+import app.nogarbo.leflac.service.planUpNextSchedule
+import app.nogarbo.leflac.service.playbackPool
+import app.nogarbo.leflac.service.queuePool
+import app.nogarbo.leflac.service.toPlaybackMediaItem
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
 
@@ -44,6 +52,9 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     private val _currentMediaId = MutableStateFlow<String?>(null)
     val currentMediaId = _currentMediaId.asStateFlow()
+
+    /** Service-fed view of the marked priority segment in the real timeline. */
+    val upNext = app.nogarbo.leflac.service.PlaybackBus.upNext.asStateFlow()
 
     // GYM SESSION: queue stays inside the gym pool until manually ended
     private val _gymMode = MutableStateFlow(false)
@@ -545,32 +556,97 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             val playlist = generateSmartQueue(libraryTracks, currentTrack)
             updateQueueInternal(playlist, 0)
         } else {
-            val playlist = libraryTracks
+            val playlist = playbackPool(libraryTracks, currentTrack)
             val startIndex = playlist.indexOf(currentTrack).coerceAtLeast(0)
             updateQueueInternal(playlist, startIndex)
         }
     }
 
-    private fun updateQueueInternal(playlist: List<app.nogarbo.leflac.data.AudioTrack>, startIndex: Int) {
-        mediaController?.shuffleModeEnabled = false 
-        
-        val controller = mediaController ?: return
-        val pos = controller.currentPosition
-        
-        val mediaItems = playlist.map { track ->
-            val metadata = MediaMetadata.Builder()
-                .setTitle(track.title)
-                .setArtist(track.artist)
-                .build()
-            MediaItem.Builder()
-                .setUri(track.uri)
-                .setMediaId(track.uri.toString())
-                .setMediaMetadata(metadata)
-                .build()
+    fun scheduleUpNext(
+        requestedTracks: List<app.nogarbo.leflac.data.AudioTrack>,
+        libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>
+    ): ScheduleUpNextResult {
+        val controller = mediaController ?: return ScheduleUpNextResult.UNAVAILABLE
+        if (!controller.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)) {
+            return ScheduleUpNextResult.UNAVAILABLE
         }
+
+        val requested = requestedTracks.distinctBy { it.uri.toString() }
+        if (requested.isEmpty()) return ScheduleUpNextResult.ALREADY_QUEUED
+        val requestedPool = requested.first().queuePool()
+        if (requested.any { it.queuePool() != requestedPool }) {
+            return ScheduleUpNextResult.WRONG_POOL
+        }
+
+        val current = controller.currentMediaItem
+        if (current == null || controller.mediaItemCount == 0) {
+            val prepared = requested.mapIndexed { index, track ->
+                val item = track.toPlaybackMediaItem()
+                if (index == 0) item else UpNextQueue.mark(item)
+            }
+            controller.setMediaItems(prepared, 0, 0L)
+            controller.prepare()
+            return ScheduleUpNextResult.ARMED
+        }
+
+        val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == current.mediaId }
+        val currentPool = currentTrack?.queuePool() ?: controller.duration
+            .takeIf { it > 0L }
+            ?.let { if (it >= MIX_DURATION_THRESHOLD_MS) QueuePool.MIX else QueuePool.SONG }
+        if (currentPool != null && currentPool != requestedPool) {
+            return ScheduleUpNextResult.WRONG_POOL
+        }
+
+        val timelineItems = (0 until controller.mediaItemCount).map(controller::getMediaItemAt)
+        val plan = planUpNextSchedule(
+            currentIndex = controller.currentMediaItemIndex,
+            timelineIds = timelineItems.map(MediaItem::mediaId),
+            marked = timelineItems.map(UpNextQueue::isMarked),
+            requestedIds = requested.map { it.uri.toString() }
+        )
+        if (plan.items.isEmpty()) return ScheduleUpNextResult.ALREADY_QUEUED
+
+        val requestedById = requested.associateBy { it.uri.toString() }
+        val markedItems = plan.items.map { planned ->
+            val item = if (planned.sourceIndex == null) {
+                requestedById.getValue(planned.mediaId).toPlaybackMediaItem()
+            } else {
+                timelineItems[planned.sourceIndex]
+            }
+            UpNextQueue.mark(item)
+        }
+
+        controller.addMediaItems(plan.insertionIndex, markedItems)
+        return ScheduleUpNextResult.ADDED
+    }
+
+    fun removeFromUpNext(entryId: String) {
+        val controller = mediaController ?: return
+        val index = UpNextQueue.pendingIndices(controller).firstOrNull { itemIndex ->
+            UpNextQueue.entryId(controller.getMediaItemAt(itemIndex)) == entryId
+        } ?: return
+        controller.removeMediaItem(index)
+    }
+
+    fun clearUpNext() {
+        val controller = mediaController ?: return
+        UpNextQueue.pendingIndices(controller)
+            .sortedDescending()
+            .forEach(controller::removeMediaItem)
+    }
+
+    private fun updateQueueInternal(playlist: List<app.nogarbo.leflac.data.AudioTrack>, startIndex: Int) {
+        val controller = mediaController ?: return
+        val mediaItems = playlist.map { it.toPlaybackMediaItem() }
+        val priorityItems = UpNextQueue.pendingItems(controller)
         
         val playingItem = controller.currentMediaItem
         if (playingItem != null && playingItem.mediaId == mediaItems[startIndex].mediaId) {
+            val rebuilt = insertPriorityAfterCurrent(
+                base = mediaItems,
+                currentIndex = startIndex,
+                priority = priorityItems
+            )
             val currentIdx = controller.currentMediaItemIndex
             
             // Remove items AFTER current
@@ -586,12 +662,12 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             // Now the playing item is at index 0.
             // Insert new items BEFORE current
             if (startIndex > 0) {
-                controller.addMediaItems(0, mediaItems.subList(0, startIndex))
+                controller.addMediaItems(0, rebuilt.subList(0, startIndex))
             }
             
             // Insert new items AFTER current
-            if (startIndex + 1 < mediaItems.size) {
-                controller.addMediaItems(startIndex + 1, mediaItems.subList(startIndex + 1, mediaItems.size))
+            if (startIndex + 1 < rebuilt.size) {
+                controller.addMediaItems(startIndex + 1, rebuilt.subList(startIndex + 1, rebuilt.size))
             }
         } else {
             if (_isShuffleEnabled.value && controller.currentMediaItemIndex != -1) {
@@ -601,14 +677,28 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                     controller.removeMediaItems(currentIdx + 1, controller.mediaItemCount)
                 }
                 
-                val itemsToAdd = mediaItems.subList(startIndex, mediaItems.size)
+                val baseFuture = mediaItems.subList(startIndex, mediaItems.size)
+                val targetMediaId = baseFuture.firstOrNull()?.mediaId
+                val preservedPriority = priorityItems.filterNot { it.mediaId == targetMediaId }
+                val itemsToAdd = insertPriorityAfterCurrent(
+                    base = baseFuture,
+                    currentIndex = 0,
+                    priority = preservedPriority
+                )
                 controller.addMediaItems(currentIdx + 1, itemsToAdd)
                 controller.seekToNextMediaItem()
                 controller.seekTo(0L) // Ensure the new track starts at the beginning
                 controller.prepare()
             } else {
                 // Sequential mode or first track: establish full album queue
-                controller.setMediaItems(mediaItems, startIndex, 0L)
+                val targetMediaId = mediaItems.getOrNull(startIndex)?.mediaId
+                val preservedPriority = priorityItems.filterNot { it.mediaId == targetMediaId }
+                val rebuilt = insertPriorityAfterCurrent(
+                    base = mediaItems,
+                    currentIndex = startIndex,
+                    priority = preservedPriority
+                )
+                controller.setMediaItems(rebuilt, startIndex, 0L)
                 controller.prepare()
             }
         }
@@ -628,15 +718,32 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun playNextSequentialFile(libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>) {
+        val controller = mediaController ?: return
+        val immediateIndex = controller.currentMediaItemIndex + 1
+        if (immediateIndex in 0 until controller.mediaItemCount &&
+            UpNextQueue.isMarked(controller.getMediaItemAt(immediateIndex))
+        ) {
+            controller.seekToNextMediaItem()
+            return
+        }
         val currentTrackId = _currentMediaId.value
-        val currentIndex = libraryTracks.indexOfFirst { it.uri.toString() == currentTrackId }
-        val nextIndex = if (currentIndex != -1) (currentIndex + 1) % libraryTracks.size else 0
-        val nextTrack = libraryTracks[nextIndex]
-        
-        if (_isShuffleEnabled.value) {
-            updateQueueInternal(generateSmartQueue(libraryTracks, nextTrack), 0)
-        } else {
-            mediaController?.seekTo(nextIndex, 0)
+        val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == currentTrackId }
+            ?: libraryTracks.firstOrNull()
+            ?: return
+        val pool = playbackPool(libraryTracks, currentTrack)
+        val currentIndex = pool.indexOfFirst { it.uri.toString() == currentTrackId }
+        val nextIndex = if (currentIndex != -1) (currentIndex + 1) % pool.size else 0
+        val nextTrack = pool[nextIndex]
+        val searchOrder = ((controller.currentMediaItemIndex + 1) until controller.mediaItemCount) +
+            (0..controller.currentMediaItemIndex)
+        val timelineIndex = searchOrder.firstOrNull { index ->
+            !UpNextQueue.isMarked(controller.getMediaItemAt(index)) &&
+                controller.getMediaItemAt(index).mediaId == nextTrack.uri.toString()
+        }
+        if (timelineIndex != null) controller.seekTo(timelineIndex, 0L)
+        else if (_isShuffleEnabled.value) updateQueueInternal(generateSmartQueue(libraryTracks, nextTrack), 0)
+        else {
+            updateQueueInternal(pool, pool.indexOf(nextTrack).coerceAtLeast(0))
         }
     }
 
@@ -654,23 +761,42 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun playPreviousSequentialFile(libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>) {
+        val controller = mediaController ?: return
         val currentTrackId = _currentMediaId.value
-        val currentIndex = libraryTracks.indexOfFirst { it.uri.toString() == currentTrackId }
+        val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == currentTrackId }
+            ?: libraryTracks.firstOrNull()
+            ?: return
+        val pool = playbackPool(libraryTracks, currentTrack)
+        val currentIndex = pool.indexOfFirst { it.uri.toString() == currentTrackId }
         val prevIndex = if (currentIndex != -1) {
-            if (currentIndex - 1 >= 0) currentIndex - 1 else libraryTracks.size - 1
+            if (currentIndex - 1 >= 0) currentIndex - 1 else pool.size - 1
         } else 0
-        val prevTrack = libraryTracks[prevIndex]
+        val prevTrack = pool[prevIndex]
         
         if (_isShuffleEnabled.value) {
             updateQueueInternal(generateSmartQueue(libraryTracks, prevTrack), 0)
         } else {
-            updateQueueInternal(libraryTracks, prevIndex)
+            updateQueueInternal(pool, prevIndex)
         }
     }
 
     fun playNextRandom(libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>) {
-        if (_isShuffleEnabled.value) {
-            mediaController?.seekToNext()
+        val controller = mediaController ?: return
+        val immediateNext = controller.currentMediaItemIndex + 1
+        if (immediateNext in 0 until controller.mediaItemCount &&
+            UpNextQueue.isMarked(controller.getMediaItemAt(immediateNext))
+        ) {
+            controller.seekToNextMediaItem()
+        } else if (_isShuffleEnabled.value) {
+            if (controller.hasNextMediaItem()) {
+                controller.seekToNextMediaItem()
+            } else {
+                val currentTrack = libraryTracks.firstOrNull {
+                    it.uri.toString() == _currentMediaId.value
+                } ?: libraryTracks.firstOrNull() ?: return
+                updateQueueInternal(generateSmartQueue(libraryTracks, currentTrack), 0)
+                if (controller.hasNextMediaItem()) controller.seekToNextMediaItem()
+            }
         } else {
             val currentTrackId = _currentMediaId.value
             val currentTrack = libraryTracks.find { it.uri.toString() == currentTrackId } ?: libraryTracks.firstOrNull() ?: return
@@ -679,8 +805,16 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             val smartQueue = generateSmartQueue(libraryTracks, currentTrack)
             val nextRandomTrack = if (smartQueue.size > 1) smartQueue[1] else currentTrack
             
-            val nextIndex = libraryTracks.indexOf(nextRandomTrack).coerceAtLeast(0)
-            mediaController?.seekTo(nextIndex, 0)
+            val timelineIndex = (0 until controller.mediaItemCount).firstOrNull { index ->
+                index != controller.currentMediaItemIndex &&
+                    controller.getMediaItemAt(index).mediaId == nextRandomTrack.uri.toString()
+            }
+            if (timelineIndex != null) {
+                controller.seekTo(timelineIndex, 0L)
+            } else {
+                val pool = playbackPool(libraryTracks, nextRandomTrack)
+                updateQueueInternal(pool, pool.indexOf(nextRandomTrack).coerceAtLeast(0))
+            }
         }
     }
 

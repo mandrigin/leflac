@@ -302,6 +302,7 @@ Recommended front-panel controls:
 
 But the meaning should be precise:
 
+- Explicit UP NEXT pins form a FIFO priority bus ahead of either rail.
 - `NEXT` follows the active rail.
 - If `AUTO` is off, the active rail is ORDER.
 - If `AUTO` is on, the active rail is RNG.
@@ -309,6 +310,18 @@ But the meaning should be precise:
 - `RNG` advances/regenerates the RNG future when `AUTO` is on.
 - `AUTO` is a latch, not a transport action.
 - Hold `PREV` or `NEXT` forces the ORDER rail as an override.
+- Hold a library track to enter UP NEXT selection; subsequent taps add a
+  homogeneous batch and `[QUEUE]` commits it without changing the current item.
+
+The resulting timeline is:
+
+```text
+HISTORY | CURRENT | UP NEXT A | UP NEXT B | ORDER/RNG FUTURE
+```
+
+Changing the rail rebuilds only the generated future. A play-now track tap
+starts a new context and clears the explicit pins. Song and mix pools remain
+separate, and the `NEXT nn` ledger tab owns review, removal, and clear-all.
 
 This keeps the original two-control idea but makes the metaphor learnable:
 

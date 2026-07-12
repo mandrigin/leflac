@@ -7,6 +7,11 @@
 > Implementation and Honda e acceptance details are in
 > [ANDROID_AUTO.md](ANDROID_AUTO.md).
 
+> **LF-1 1.2 update:** long-press track selection now commits a real FIFO
+> UP NEXT segment ahead of ORDER/RNG. A fourth ledger tab makes the scheduled
+> order, removal, clear-all, selection state, haptics, and accessibility labels
+> visible without converting the player into a generic modal queue editor.
+
 Date: 2026-06-11  
 Scope: local repo review, `screen.png`, `screen2.png`, README, primary Compose UI, theme, library, scrubber, and rear panel code.
 

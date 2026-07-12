@@ -122,6 +122,7 @@ class MainActivity : ComponentActivity() {
                 val spectrum by playbackViewModel.spectrum.collectAsState()
                 val isShuffleEnabled by playbackViewModel.isShuffleEnabled.collectAsState()
                 val currentMediaId by playbackViewModel.currentMediaId.collectAsState()
+                val upNext by playbackViewModel.upNext.collectAsState()
                 val mixes by libraryViewModel.mixes.collectAsState()
                 val isMixPlaying = currentMediaId != null && mixes.any { it.uri.toString() == currentMediaId }
 
@@ -664,19 +665,45 @@ class MainActivity : ComponentActivity() {
                              app.nogarbo.leflac.ui.library.LibraryGrid(
                                   viewModel = libraryViewModel,
                                   playingTrackId = currentMediaId,
+                                  upNext = upNext,
                                   onGymStart = { playbackViewModel.setGymMode(true) },
+                                  onTracksQueued = { tracks ->
+                                      val result = playbackViewModel.scheduleUpNext(
+                                          tracks,
+                                          libraryViewModel.allTracks.value
+                                      )
+                                      val message = when (result) {
+                                          app.nogarbo.leflac.service.ScheduleUpNextResult.ADDED ->
+                                              "UP NEXT · ${tracks.size.toString().padStart(2, '0')}"
+                                          app.nogarbo.leflac.service.ScheduleUpNextResult.ARMED ->
+                                              "DECK ARMED · PRESS PLAY"
+                                          app.nogarbo.leflac.service.ScheduleUpNextResult.ALREADY_QUEUED ->
+                                              "ALREADY UP NEXT"
+                                          app.nogarbo.leflac.service.ScheduleUpNextResult.WRONG_POOL ->
+                                              "QUEUE LOCKED TO ${if (isMixPlaying) "MIXES" else "SONGS"}"
+                                          app.nogarbo.leflac.service.ScheduleUpNextResult.UNAVAILABLE ->
+                                              "QUEUE CONTROLLER OFFLINE"
+                                      }
+                                      android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
+                                      result != app.nogarbo.leflac.service.ScheduleUpNextResult.WRONG_POOL &&
+                                          result != app.nogarbo.leflac.service.ScheduleUpNextResult.UNAVAILABLE
+                                  },
+                                  onUpNextRemoved = playbackViewModel::removeFromUpNext,
+                                  onUpNextCleared = playbackViewModel::clearUpNext,
                                   onTrackSelected = { track ->
                                        // Smart queue stays within the track's pool: mixes shuffle
                                        // among mixes, songs among songs.
+                                       val allTracks = libraryViewModel.allTracks.value
                                        val playlist = if (isShuffleEnabled) {
-                                           playbackViewModel.generateSmartQueue(libraryViewModel.allTracks.value, track)
+                                           playbackViewModel.generateSmartQueue(allTracks, track)
                                        } else {
-                                           libraryViewModel.allTracks.value
+                                           app.nogarbo.leflac.service.playbackPool(allTracks, track)
                                        }
 
                                        val uris = ArrayList<android.os.Parcelable>(playlist.map { it.uri })
                                        val titles = ArrayList<String>(playlist.map { it.title })
                                        val artists = ArrayList<String>(playlist.map { it.artist })
+                                       val durations = playlist.map { it.duration }.toLongArray()
                                        val startIndex = if (isShuffleEnabled) 0 else playlist.indexOf(track).coerceAtLeast(0)
 
                                        val intent = Intent(context, app.nogarbo.leflac.service.AudioService::class.java)
@@ -684,6 +711,7 @@ class MainActivity : ComponentActivity() {
                                        intent.putParcelableArrayListExtra("URIS", uris)
                                        intent.putStringArrayListExtra("TITLES", titles)
                                        intent.putStringArrayListExtra("ARTISTS", artists)
+                                       intent.putExtra("DURATIONS", durations)
                                        intent.putExtra("START_INDEX", startIndex)
                                        context.startForegroundService(
                                            app.nogarbo.leflac.service.AudioCommandBus.authorize(intent)

@@ -4,6 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -224,7 +226,8 @@ fun RearPanel(
         Column(
             modifier = Modifier
                 .align(Alignment.Center)
-                .padding(horizontal = 48.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 48.dp, vertical = 24.dp)
         ) {
             Text(
                 text = "LF-1 — OPERATOR'S MANUAL",
@@ -240,6 +243,8 @@ fun RearPanel(
             ManualRow("[<][>]", "PREV / NEXT — IN A MIX: JUMPS BETWEEN CUES")
             ManualRow("HOLD [<]", "PUNCH-IN — SEQUENTIAL REWIND + TARGET LOCK")
             ManualRow("RNG", "RANDOM TRACK — RESPECTS SONG/MIX POOLS")
+            ManualRow("HOLD TRACK", "SELECT UP NEXT · TAP MORE · [QUEUE]")
+            ManualRow("UP NEXT", "PRIORITY BUS — RUNS BEFORE EITHER RAIL")
             ManualRow("ORDER/RNG", "RAIL LATCH — NEXT FOLLOWS ORDER OR SMART FUTURE")
             ManualRow("RAIL", "DRAG TO SEEK · TALL TICKS = CUE POINTS", info = true)
             ManualRow("FLAME", "HOT NOW — YOUR CURRENT HEAT", info = true)

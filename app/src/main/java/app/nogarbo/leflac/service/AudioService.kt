@@ -27,7 +27,9 @@ import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.MoreExecutors
+import org.json.JSONArray
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 @OptIn(UnstableApi::class)
 class AudioService : MediaLibraryService() {
@@ -56,6 +58,9 @@ class AudioService : MediaLibraryService() {
     private var lastStatsTickMs = android.os.SystemClock.elapsedRealtime()
     private var pendingMixResumeId: String? = null
     private var lastMixPositionSaveMs = 0L
+    private var pruningConsumedUpNext = false
+    private val prunedUpNextTokens = mutableSetOf<String>()
+    private val queueGeneration = AtomicLong(0L)
 
     private val seekReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(context: android.content.Context?, intent: Intent?) {
@@ -72,6 +77,9 @@ class AudioService : MediaLibraryService() {
         var instance: AudioService? = null
         private const val PREF_LAST_MEDIA_ID = "playback_last_media_id"
         private const val PREF_LAST_POSITION_MS = "playback_last_position_ms"
+        private const val PREF_UP_NEXT_MEDIA_IDS = "playback_up_next_media_ids"
+        private const val PREF_FUTURE_MEDIA_IDS = "playback_future_media_ids"
+        private const val MAX_PERSISTED_FUTURE_ITEMS = 512
     }
 
     @OptIn(UnstableApi::class)
@@ -106,14 +114,21 @@ class AudioService : MediaLibraryService() {
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val nextMediaId = mediaItem?.mediaId
-                // Artwork refresh replaces the current MediaItem with the
-                // same ID. It is metadata, not a listen boundary.
-                if (nextMediaId != trackedMediaId) {
+                // Artwork/rail refresh replaces the current MediaItem with
+                // the same ID using a playlist-changed transition. Automatic,
+                // seek, and repeat transitions are real boundaries even when
+                // a generated RNG queue places the same ID twice in a row.
+                val metadataOnlyRefresh =
+                    reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED &&
+                        nextMediaId == trackedMediaId
+                if (!metadataOnlyRefresh) {
                     settleTrackedPlay()
                     trackedMediaId = nextMediaId
                     trackedDurationMs = player.duration.coerceAtLeast(0L)
                     pendingMixResumeId = nextMediaId
                 }
+                if (!metadataOnlyRefresh) pruneConsumedUpNextDuplicates()
+                publishUpNext()
                 persistPlaybackState()
             }
 
@@ -131,6 +146,12 @@ class AudioService : MediaLibraryService() {
                 reason: Int
             ) {
                 if (player.duration > 0L) trackedDurationMs = player.duration
+                publishUpNext()
+                persistPlaybackState()
+            }
+
+            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                if (shuffleModeEnabled) player.shuffleModeEnabled = false
             }
         })
             
@@ -165,6 +186,8 @@ class AudioService : MediaLibraryService() {
         mediaSession = MediaLibrarySession.Builder(this, player, LibraryCallback())
             .setSessionActivity(pendingIntent)
             .build()
+
+        restoreTimelineWithoutAutoplay()
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
@@ -250,11 +273,171 @@ class AudioService : MediaLibraryService() {
 
     private fun persistPlaybackState() {
         if (!::player.isInitialized) return
-        val mediaId = player.currentMediaItem?.mediaId ?: return
-        playbackPrefs.edit()
+        val pendingJson = JSONArray().apply {
+            UpNextQueue.pendingItems(player).forEach { item ->
+                put(item.mediaId)
+            }
+        }.toString()
+        val currentIndex = player.currentMediaItemIndex
+        val futureJson = JSONArray().apply {
+            if (currentIndex != C.INDEX_UNSET) {
+                val pendingCount = UpNextQueue.pendingItems(player).size
+                val end = (
+                    currentIndex.toLong() + 1L + pendingCount + MAX_PERSISTED_FUTURE_ITEMS
+                ).coerceAtMost(player.mediaItemCount.toLong()).toInt()
+                for (index in currentIndex until end) {
+                    put(player.getMediaItemAt(index).mediaId)
+                }
+            }
+        }.toString()
+        val editor = playbackPrefs.edit()
+            .putString(PREF_UP_NEXT_MEDIA_IDS, pendingJson)
+            .putString(PREF_FUTURE_MEDIA_IDS, futureJson)
+        val mediaId = player.currentMediaItem?.mediaId
+        if (mediaId == null) {
+            editor.apply()
+            return
+        }
+        editor
             .putString(PREF_LAST_MEDIA_ID, mediaId)
             .putLong(PREF_LAST_POSITION_MS, player.currentPosition.coerceAtLeast(0L))
             .apply()
+    }
+
+    private fun publishUpNext() {
+        if (!::player.isInitialized) return
+        PlaybackBus.upNext.value = UpNextQueue.pendingEntries(player)
+    }
+
+    /**
+     * Scheduling leaves the underlying rail intact so remove/clear are lossless.
+     * Once a marked occurrence has actually been consumed, remove its first
+     * remaining natural duplicate to complete the promotion without replaying it.
+     */
+    private fun pruneConsumedUpNextDuplicates() {
+        if (pruningConsumedUpNext || !::player.isInitialized) return
+        val currentIndex = player.currentMediaItemIndex
+        if (currentIndex == C.INDEX_UNSET) return
+        val consumed = (0..currentIndex)
+            .map(player::getMediaItemAt)
+            .filter { item ->
+                UpNextQueue.isMarked(item) &&
+                    UpNextQueue.entryId(item) !in prunedUpNextTokens
+            }
+            .distinctBy(UpNextQueue::entryId)
+        if (consumed.isEmpty()) return
+
+        val timelineItems = (0 until player.mediaItemCount).map(player::getMediaItemAt)
+        val timelineIds = timelineItems.map(MediaItem::mediaId)
+        val marked = timelineItems.map(UpNextQueue::isMarked)
+        val claimed = mutableSetOf<Int>()
+        val duplicates = consumed.mapNotNull { consumedItem ->
+            val duplicate = firstUnmarkedFutureIndex(
+                currentIndex = currentIndex,
+                timelineIds = timelineIds,
+                marked = marked,
+                targetId = consumedItem.mediaId,
+                excludedIndices = claimed
+            )
+            UpNextQueue.entryId(consumedItem)?.let(prunedUpNextTokens::add)
+            duplicate?.also(claimed::add)
+        }
+        if (duplicates.isEmpty()) return
+
+        pruningConsumedUpNext = true
+        try {
+            duplicates.sortedDescending().forEach(player::removeMediaItem)
+        } finally {
+            pruningConsumedUpNext = false
+        }
+    }
+
+    private fun restoredUpNextMediaIds(): List<String> {
+        val raw = playbackPrefs.getString(PREF_UP_NEXT_MEDIA_IDS, null) ?: return emptyList()
+        return try {
+            val json = JSONArray(raw)
+            buildList(json.length()) {
+                for (index in 0 until json.length()) {
+                    json.optString(index).takeIf(String::isNotBlank)?.let(::add)
+                }
+            }
+        } catch (_: org.json.JSONException) {
+            emptyList()
+        }
+    }
+
+    private fun restoredFutureMediaIds(): List<String> {
+        val raw = playbackPrefs.getString(PREF_FUTURE_MEDIA_IDS, null) ?: return emptyList()
+        return try {
+            val json = JSONArray(raw)
+            buildList(json.length()) {
+                for (index in 0 until json.length()) {
+                    json.optString(index).takeIf(String::isNotBlank)?.let(::add)
+                }
+            }
+        } catch (_: org.json.JSONException) {
+            emptyList()
+        }
+    }
+
+    private fun restoredQueue(
+        snapshot: app.nogarbo.leflac.data.LocalAudioLibrarySnapshot,
+        mediaId: String
+    ): Pair<List<MediaItem>, Int>? {
+        val currentTrack = snapshot.findByMediaId(mediaId) ?: return null
+        val pool = currentTrack.queuePool()
+        val persisted = restoredFutureMediaIds()
+            .mapNotNull(snapshot::findByMediaId)
+            .filter { it.queuePool() == pool }
+
+        if (persisted.firstOrNull()?.uri?.toString() == mediaId) {
+            val pending = restoredUpNextMediaIds()
+                .filter { pendingId ->
+                    snapshot.findByMediaId(pendingId)?.queuePool() == pool
+                }
+            val markedIndices = mutableSetOf<Int>()
+            var searchFrom = 1
+            pending.forEach { scheduledId ->
+                val index = (searchFrom until persisted.size).firstOrNull { candidate ->
+                    persisted[candidate].uri.toString() == scheduledId
+                }
+                if (index != null) {
+                    markedIndices += index
+                    searchFrom = index + 1
+                }
+            }
+            val items = persisted.mapIndexed { index, track ->
+                val item = autoLibrary.playbackItem(track)
+                if (index in markedIndices) UpNextQueue.mark(item) else item
+            }
+            return items to 0
+        }
+
+        val base = autoLibrary.queueFor(mediaId, snapshot) ?: return null
+        val restored = restoredUpNextMediaIds().mapNotNull { scheduledId ->
+            val track = snapshot.findByMediaId(scheduledId)
+                ?: return@mapNotNull null
+            if (track.queuePool() != pool) return@mapNotNull null
+            UpNextQueue.mark(autoLibrary.playbackItem(track))
+        }
+        return insertPriorityAfterCurrent(base.first, base.second, restored) to base.second
+    }
+
+    private fun restoreTimelineWithoutAutoplay() {
+        libraryExecutor.execute {
+            val mediaId = playbackPrefs.getString(PREF_LAST_MEDIA_ID, null) ?: return@execute
+            val snapshot = localLibrary.load()
+            val restored = restoredQueue(snapshot, mediaId) ?: return@execute
+            val positionMs = playbackPrefs.getLong(PREF_LAST_POSITION_MS, 0L).coerceAtLeast(0L)
+            serviceScope.launch {
+                if (player.mediaItemCount == 0) {
+                    player.setMediaItems(restored.first, restored.second, positionMs)
+                    player.prepare()
+                    // Preparation is local and paused; never set playWhenReady
+                    // merely because a phone/car controller connected.
+                }
+            }
+        }
     }
 
     private fun updatePlaybackAccounting() {
@@ -336,6 +519,19 @@ class AudioService : MediaLibraryService() {
     }
 
     private inner class LibraryCallback : MediaLibrarySession.Callback {
+
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ): MediaSession.ConnectionResult =
+            MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailablePlayerCommands(
+                    MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS
+                        .buildUpon()
+                        .remove(Player.COMMAND_SET_SHUFFLE_MODE)
+                        .build()
+                )
+                .build()
 
         override fun onGetLibraryRoot(
             session: MediaLibrarySession,
@@ -423,10 +619,34 @@ class AudioService : MediaLibraryService() {
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
             mediaItems: List<MediaItem>
-        ): ListenableFuture<List<MediaItem>> = libraryExecutor.submit<List<MediaItem>> {
-            val snapshot = localLibrary.load()
-            mediaItems.mapNotNull { requested ->
-                resolveRequestedItem(requested, snapshot)
+        ): ListenableFuture<List<MediaItem>> {
+            if (mediaItems.isEmpty()) return Futures.immediateFuture(emptyList())
+            val currentMediaId = player.currentMediaItem?.mediaId
+            val currentDuration = player.currentMediaItem?.mediaMetadata?.durationMs
+                ?: player.duration.takeIf { it > 0L }
+            val currentPool = poolFromDuration(currentDuration)
+            val canResolveImmediately = mediaItems.all { item ->
+                item.localConfiguration?.uri != null && mediaItemPool(item, null) != null
+            }
+            if (canResolveImmediately) {
+                return Futures.immediateFuture(
+                    samePoolItems(mediaItems, currentPool, null)
+                )
+            }
+
+            val generation = queueGeneration.get()
+            return libraryExecutor.submit<List<MediaItem>> {
+                if (generation != queueGeneration.get()) return@submit emptyList()
+                val snapshot = localLibrary.load()
+                val requiredPool = currentMediaId
+                    ?.let(snapshot::findByMediaId)
+                    ?.queuePool()
+                    ?: currentPool
+                val resolved = mediaItems.mapNotNull { requested ->
+                    resolveRequestedItem(requested, snapshot)
+                }
+                if (generation != queueGeneration.get()) return@submit emptyList()
+                samePoolItems(resolved, requiredPool, snapshot)
             }
         }
 
@@ -436,23 +656,34 @@ class AudioService : MediaLibraryService() {
             mediaItems: List<MediaItem>,
             startIndex: Int,
             startPositionMs: Long
-        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
-            libraryExecutor.submit<MediaSession.MediaItemsWithStartPosition> {
-                // Phone queues already contain playable URIs and must remain
-                // byte-for-byte in their smart/sequential order.
-                if (mediaItems.isNotEmpty() && mediaItems.all { it.localConfiguration?.uri != null }) {
-                    return@submit MediaSession.MediaItemsWithStartPosition(
-                        mediaItems,
-                        startIndex.coerceIn(0, mediaItems.lastIndex),
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val generation = queueGeneration.incrementAndGet()
+            // Phone queues already contain playable URIs; resolve these on the
+            // session thread so a following play-now command cannot be overtaken
+            // by a deferred add from the previous context.
+            if (mediaItems.isNotEmpty() && mediaItems.all { it.localConfiguration?.uri != null }) {
+                val resolved = samePoolItems(mediaItems, null, null)
+                return Futures.immediateFuture(
+                    MediaSession.MediaItemsWithStartPosition(
+                        resolved,
+                        if (resolved.isEmpty()) 0 else startIndex.coerceIn(0, resolved.lastIndex),
                         startPositionMs
                     )
-                }
+                )
+            }
 
+            return libraryExecutor.submit<MediaSession.MediaItemsWithStartPosition> {
+                if (generation != queueGeneration.get()) {
+                    throw IllegalStateException("Playback queue context changed")
+                }
                 val snapshot = localLibrary.load()
                 if (mediaItems.size == 1) {
                     val requested = mediaItems.first()
                     val selectedMediaId = resolveRequestedMediaId(requested, snapshot)
                     selectedMediaId?.let { autoLibrary.queueFor(it, snapshot) }?.let { (queue, selectedIndex) ->
+                        if (generation != queueGeneration.get()) {
+                            throw IllegalStateException("Playback queue context changed")
+                        }
                         return@submit MediaSession.MediaItemsWithStartPosition(
                             queue,
                             selectedIndex,
@@ -464,25 +695,34 @@ class AudioService : MediaLibraryService() {
                 val resolved = mediaItems.mapNotNull { requested ->
                     resolveRequestedItem(requested, snapshot)
                 }
-                if (mediaItems.isNotEmpty() && resolved.isEmpty()) {
+                if (generation != queueGeneration.get()) {
+                    throw IllegalStateException("Playback queue context changed")
+                }
+                val samePool = samePoolItems(resolved, null, snapshot)
+                if (mediaItems.isNotEmpty() && samePool.isEmpty()) {
                     throw IllegalArgumentException("No local media matched the Android Auto request")
                 }
                 MediaSession.MediaItemsWithStartPosition(
-                    resolved,
-                    if (resolved.isEmpty()) 0 else startIndex.coerceIn(0, resolved.lastIndex),
+                    samePool,
+                    if (samePool.isEmpty()) 0 else startIndex.coerceIn(0, samePool.lastIndex),
                     startPositionMs
                 )
             }
+        }
 
         override fun onPlaybackResumption(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
             isForPlayback: Boolean
-        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
-            libraryExecutor.submit<MediaSession.MediaItemsWithStartPosition> {
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val generation = queueGeneration.get()
+            return libraryExecutor.submit<MediaSession.MediaItemsWithStartPosition> {
                 val mediaId = playbackPrefs.getString(PREF_LAST_MEDIA_ID, null)
                 val positionMs = playbackPrefs.getLong(PREF_LAST_POSITION_MS, 0L).coerceAtLeast(0L)
-                val queue = mediaId?.let { autoLibrary.queueFor(it, localLibrary.load()) }
+                val queue = mediaId?.let { restoredQueue(localLibrary.load(), it) }
+                if (generation != queueGeneration.get()) {
+                    throw IllegalStateException("Playback queue context changed")
+                }
                 if (queue == null) {
                     MediaSession.MediaItemsWithStartPosition(emptyList(), C.INDEX_UNSET, C.TIME_UNSET)
                 } else if (!isForPlayback) {
@@ -495,6 +735,7 @@ class AudioService : MediaLibraryService() {
                     MediaSession.MediaItemsWithStartPosition(queue.first, queue.second, positionMs)
                 }
             }
+        }
 
         private fun resolveRequestedMediaId(
             requested: MediaItem,
@@ -540,12 +781,61 @@ class AudioService : MediaLibraryService() {
             requested: MediaItem,
             snapshot: app.nogarbo.leflac.data.LocalAudioLibrarySnapshot
         ): MediaItem? {
-            requested.takeIf { it.localConfiguration?.uri != null }?.let { return it }
+            requested.takeIf { it.localConfiguration?.uri != null }?.let {
+                return withCarArtwork(it)
+            }
             resolveRequestedMediaId(requested, snapshot)?.let { mediaId ->
                 autoLibrary.playbackItem(mediaId, snapshot)?.let { return it }
             }
             return requested.requestMetadata.mediaUri?.let { uri ->
-                requested.buildUpon().setUri(uri).build()
+                withCarArtwork(requested.buildUpon().setUri(uri).build())
+            }
+        }
+
+        private fun withCarArtwork(item: MediaItem): MediaItem {
+            if (item.mediaMetadata.artworkData != null || item.mediaMetadata.artworkUri != null) {
+                return item
+            }
+            val metadata = item.mediaMetadata.buildUpon()
+                .setArtworkUri(
+                    autoLibrary.artworkUri(AndroidAutoVisualScheme.read(this@AudioService))
+                )
+                .build()
+            return item.buildUpon().setMediaMetadata(metadata).build()
+        }
+
+        private fun poolFromDuration(durationMs: Long?): QueuePool? =
+            durationMs?.takeIf { it >= 0L && it != C.TIME_UNSET }?.let { duration ->
+                if (duration >= app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS) {
+                    QueuePool.MIX
+                } else {
+                    QueuePool.SONG
+                }
+            }
+
+        private fun mediaItemPool(
+            item: MediaItem,
+            snapshot: app.nogarbo.leflac.data.LocalAudioLibrarySnapshot?
+        ): QueuePool? {
+            val track = snapshot?.findByMediaId(item.mediaId)
+                ?: snapshot?.let { library ->
+                    item.localConfiguration?.uri?.toString()?.let(library::findByMediaId)
+                }
+            return track?.queuePool() ?: poolFromDuration(item.mediaMetadata.durationMs)
+        }
+
+        private fun samePoolItems(
+            items: List<MediaItem>,
+            requiredPool: QueuePool?,
+            snapshot: app.nogarbo.leflac.data.LocalAudioLibrarySnapshot?
+        ): List<MediaItem> {
+            var targetPool = requiredPool
+            return buildList {
+                items.forEach { item ->
+                    val pool = mediaItemPool(item, snapshot) ?: return@forEach
+                    if (targetPool == null) targetPool = pool
+                    if (pool == targetPool) add(withCarArtwork(item))
+                }
             }
         }
     }
@@ -555,9 +845,11 @@ class AudioService : MediaLibraryService() {
         
         when (intent?.action) {
             AudioCommandBus.ACTION_PLAY_LIST -> if (AudioCommandBus.isAuthorized(intent)) {
+                queueGeneration.incrementAndGet()
                 val uris = intent.getParcelableArrayListExtra("URIS", android.net.Uri::class.java)
                 val titles = intent.getStringArrayListExtra("TITLES")
                 val artists = intent.getStringArrayListExtra("ARTISTS")
+                val durations = intent.getLongArrayExtra("DURATIONS")
                 val startIndex = intent.getIntExtra("START_INDEX", 0)
                 
                 if (!uris.isNullOrEmpty()) {
@@ -565,12 +857,12 @@ class AudioService : MediaLibraryService() {
                     val mediaItems = uris.mapIndexed { index, uri ->
                         val title = titles?.getOrNull(index) ?: "Unknown Track"
                         val artist = artists?.getOrNull(index) ?: "Unknown Artist"
-                        
-                        val metadata = MediaMetadata.Builder()
+                        val metadataBuilder = MediaMetadata.Builder()
                             .setTitle(title)
                             .setArtist(artist)
                             .setArtworkUri(artworkUri)
-                            .build()
+                        durations?.getOrNull(index)?.takeIf { it >= 0L }?.let(metadataBuilder::setDurationMs)
+                        val metadata = metadataBuilder.build()
                             
                         MediaItem.Builder()
                             .setUri(uri)
