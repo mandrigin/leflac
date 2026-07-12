@@ -16,6 +16,17 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.NothingFLACPlayer"
         tools:targetApi="31">
+        <!-- Projected Android Auto discovers this APK as a media app. -->
+        <meta-data
+            android:name="com.google.android.gms.car.application"
+            android:resource="@xml/automotive_app_desc" />
+        <meta-data
+            android:name="com.google.android.gms.car.application.theme"
+            android:resource="@style/Theme.LeFlac.Car" />
+        <meta-data
+            android:name="androidx.car.app.TintableAttributionIcon"
+            android:resource="@drawable/ic_glyph_toy_cassette" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -41,9 +52,22 @@
             android:exported="true"
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
-                <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="androidx.media3.session.MediaLibraryService" />
+                <!-- Required by projected Android Auto and legacy car hosts. -->
+                <action android:name="android.media.browse.MediaBrowserService" />
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
             </intent-filter>
         </service>
+
+        <!-- Lets System UI/Android Auto restore session metadata and playback
+             after the service process has been reclaimed. -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
         
         <receiver android:name=".widget.GlyphToyWidget"
             android:exported="true">

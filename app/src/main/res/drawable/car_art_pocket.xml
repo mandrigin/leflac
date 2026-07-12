@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="192dp"
+    android:height="192dp"
+    android:viewportWidth="512"
+    android:viewportHeight="512">
+    <!-- App-owned Android Auto art: four-tone, passive-matrix POCKET glass. -->
+    <path android:fillColor="#8B9B74" android:pathData="M0,0h512v512h-512z" />
+    <path android:fillColor="#586A4C" android:pathData="M32,32h448v448h-448z" />
+    <path android:fillColor="#7A8B60" android:pathData="M48,48h416v416h-416z" />
+    <path android:fillColor="#1A2F1A" android:pathData="M76,76h360v232h-360z" />
+    <path android:fillColor="#8B9B74" android:pathData="M92,92h328v200h-328z" />
+    <path android:fillColor="#7A8B60" android:pathData="M108,108h296v168h-296z" />
+    <!-- Pixel transport rail and play marker. -->
+    <path android:fillColor="#586A4C" android:pathData="M128,184h256v16h-256z" />
+    <path android:fillColor="#1A2F1A" android:pathData="M240,144l64,48l-64,48z" />
+    <path android:fillColor="#1A2F1A" android:pathData="M112,328h56v32h32v56h-32v32h-56v-32h-32v-56h32z" />
+    <path android:fillColor="#1A2F1A" android:pathData="M328,348h48v48h-48zM392,388h48v48h-48z" />
+    <!-- LF-1 pixel signature. -->
+    <path android:fillColor="#1A2F1A" android:pathData="M232,344h16v72h48v16h-64zM312,344h64v16h-48v16h40v16h-40v40h-16z" />
+</vector>

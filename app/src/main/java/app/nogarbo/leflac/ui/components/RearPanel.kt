@@ -24,7 +24,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import app.nogarbo.leflac.ui.skins.LocalFieldSkin
+import app.nogarbo.leflac.data.AndroidAutoVisualScheme
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.nativeCanvas
 
@@ -37,6 +41,8 @@ import androidx.compose.ui.graphics.nativeCanvas
 fun RearPanel(
     themeMode: Int = 0,
     onThemeModeChange: (Int) -> Unit = {},
+    androidAutoVisualScheme: AndroidAutoVisualScheme = AndroidAutoVisualScheme.POCKET,
+    onAndroidAutoVisualSchemeChange: (AndroidAutoVisualScheme) -> Unit = {},
     voiceOn: Boolean = false,
     onVoiceChange: (Boolean) -> Unit = {},
     onTap: () -> Unit
@@ -152,7 +158,7 @@ fun RearPanel(
             // file, every trace a call path. Orange = audio, cyan = data.
 
             // TOP BAND — ingestion & analysis
-            chip(0.06f, 0.26f, 0.042f, "LIBRARY.VM", "U1", cool)   // LibraryViewModel
+            chip(0.06f, 0.26f, 0.042f, "LOCAL.LIB", "U1", cool)    // LocalAudioLibrary
             chip(0.34f, 0.55f, 0.042f, "ANLYS.REPO", "U2", cool)   // AnalysisRepository
             chip(0.63f, 0.86f, 0.042f, "TRK.ANLYZR", "U3", cool)   // AudioTrackAnalyzer
             chip(0.06f, 0.21f, 0.122f, "FLAC.DEC", "U4", hot)      // native-lib.cpp
@@ -186,6 +192,14 @@ fun RearPanel(
             // off-board: the OS mixer feeds the speaker
             wire(listOf(0.0f to 0.846f, 0.06f to 0.846f), hot)
             text("J1·AUDIOFLINGER", 0.005f * w, 0.835f * h, faint, 11f)
+            // Projected Android Auto enters through the browsable Media3
+            // session; it never bypasses the one playback owner.
+            wire(
+                listOf(1.0f to 0.800f, 0.92f to 0.800f, 0.92f to 0.790f,
+                    0.15f to 0.790f, 0.15f to 0.825f),
+                cool
+            )
+            text("J4·ANDROID AUTO · AUTO.LIB", 0.60f * w, 0.782f * h, cool, 11f)
             // audio path along row A
             wire(listOf(0.24f to 0.846f, 0.32f to 0.846f), hot)                                      // service -> exoplayer
             wire(listOf(0.52f to 0.846f, 0.60f to 0.846f), hot)                                      // exoplayer -> bus
@@ -246,14 +260,25 @@ fun RearPanel(
             DipSwitch(
                 label = "SKIN",
                 options = listOf("AUTO", "FIELD", "POCKET"),
-                selected = when (themeMode) { 1 -> 1; 2 -> 2; else -> 0 },
+                selectedIndex = when (themeMode) { 1 -> 1; 2 -> 2; else -> 0 },
                 onSelect = { onThemeModeChange(when (it) { 1 -> 1; 2 -> 2; else -> 0 }) }
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            DipSwitch(
+                label = "CAR SKIN",
+                options = listOf("POCKET", "FIELD"),
+                selectedIndex = if (androidAutoVisualScheme == AndroidAutoVisualScheme.POCKET) 0 else 1,
+                onSelect = {
+                    onAndroidAutoVisualSchemeChange(
+                        if (it == 0) AndroidAutoVisualScheme.POCKET else AndroidAutoVisualScheme.FIELD
+                    )
+                }
             )
             Spacer(modifier = Modifier.height(4.dp))
             DipSwitch(
                 label = "VOICE",
                 options = listOf("OFF", "ON"),
-                selected = if (voiceOn) 1 else 0,
+                selectedIndex = if (voiceOn) 1 else 0,
                 onSelect = { onVoiceChange(it == 1) }
             )
 
@@ -270,7 +295,7 @@ fun RearPanel(
 }
 
 @Composable
-private fun DipSwitch(label: String, options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+private fun DipSwitch(label: String, options: List<String>, selectedIndex: Int, onSelect: (Int) -> Unit) {
     val skin = LocalFieldSkin.current
     val ink = MaterialTheme.colorScheme.onBackground
     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -283,11 +308,15 @@ private fun DipSwitch(label: String, options: List<String>, selected: Int, onSel
         )
         Spacer(modifier = Modifier.width(8.dp))
         options.forEachIndexed { i, opt ->
-            val active = i == selected
+            val active = i == selectedIndex
             Box(
                 modifier = Modifier
                     .border(1.dp, if (active) skin.accent else skin.dim)
                     .background(if (active) skin.accent else androidx.compose.ui.graphics.Color.Transparent)
+                    .semantics {
+                        selected = active
+                        contentDescription = "$label: $opt"
+                    }
                     .clickable { onSelect(i) }
                     .padding(horizontal = 10.dp, vertical = 4.dp)
             ) {

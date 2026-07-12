@@ -123,29 +123,15 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
                     _duration.value = player.duration.coerceAtLeast(0)
-                    // Snapshot for play credit: belongs to the item playing NOW
-                    currentItemDurationMs = player.duration.coerceAtLeast(0)
-                    maybeResumeMix(player)
-                }
-                if (playbackState == Player.STATE_ENDED) {
-                    // Queue finished: there is no upcoming transition to settle
-                    // the last track's credit, so do it here.
-                    settlePlayCredit()
                 }
             }
 
             override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
                  _duration.value = player.duration.coerceAtLeast(0)
-                 if (player.duration > 0) currentItemDurationMs = player.duration
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                // Settle play/skip credit for the track we are leaving
-                settlePlayCredit()
-
                 _currentMediaId.value = mediaItem?.mediaId
-                pendingMixResumeId = mediaItem?.mediaId
-                currentItemDurationMs = player.duration.coerceAtLeast(0)
                 _duration.value = player.duration.coerceAtLeast(0)
                 _spectralHistory.value = emptyList() // Reset history for new track
                 
@@ -332,76 +318,13 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     private val _spectralHistory = MutableStateFlow<List<SpectralPoint>>(emptyList())
     val spectralHistory = _spectralHistory.asStateFlow()
 
-    private var currentTrackListenedMs = 0L
-    private var runtimeAccMs = 0L
-    private var currentItemDurationMs = 0L
-    private var lastUpdateTimeMs = System.currentTimeMillis()
-
-    // DJ sets must pick up where you left off. Set on transition, consumed
-    // once the duration is known (STATE_READY).
-    private var pendingMixResumeId: String? = null
-    private var lastMixPositionSaveMs = 0L
-
-    private fun maybeResumeMix(player: Player) {
-        val id = _currentMediaId.value ?: return
-        if (id != pendingMixResumeId) return
-        pendingMixResumeId = null
-        val dur = player.duration
-        if (dur < MIX_DURATION_THRESHOLD_MS) return
-        val saved = app.nogarbo.leflac.data.PlayStatsStore.getPosition(getApplication(), id)
-        // Resume only if meaningfully in: past 30s, more than a minute left
-        if (saved in 30_000 until (dur - 60_000) && player.currentPosition < 5_000) {
-            android.util.Log.i("FLAC_STATS", "Resuming mix $id at ${saved / 1000}s")
-            player.seekTo(saved)
-        }
-    }
-
-    /**
-     * Settle the play/skip credit for the track being left. Scrobble-style
-     * rules: a play needs >= 50% listened or >= 4 minutes (whichever is
-     * less); leaving before 20% (but after at least 2s) counts as a skip.
-     * Resets the listen clock, so calling it twice is harmless.
-     */
-    private fun settlePlayCredit() {
-        val id = _currentMediaId.value
-        val dur = currentItemDurationMs
-        val listened = currentTrackListenedMs
-        currentTrackListenedMs = 0L
-        if (id == null || dur <= 0) return
-        val ctx = getApplication<Application>()
-        val playThreshold = minOf(dur / 2, 240_000L)
-        when {
-            listened >= playThreshold -> {
-                app.nogarbo.leflac.data.PlayStatsStore.recordPlay(ctx, id)
-                // A finished mix starts from the top next time
-                if (dur >= MIX_DURATION_THRESHOLD_MS && listened >= dur * 9 / 10) {
-                    app.nogarbo.leflac.data.PlayStatsStore.savePosition(ctx, id, 0L)
-                }
-            }
-            listened in 2_000L until dur / 5 ->
-                app.nogarbo.leflac.data.PlayStatsStore.recordSkip(ctx, id)
-        }
-    }
-
     private fun startPositionUpdater() {
         viewModelScope.launch {
             while (true) {
                 val controller = mediaController
                 val timeSinceSeek = System.currentTimeMillis() - lastSeekTime
                 
-                val now = System.currentTimeMillis()
-                val delta = now - lastUpdateTimeMs
-                lastUpdateTimeMs = now
-                
                 if (controller != null && controller.isPlaying) {
-                     currentTrackListenedMs += delta
-                     // Lifetime runtime, etched on the rear panel
-                     runtimeAccMs += delta
-                     if (runtimeAccMs > 60_000) {
-                         val total = prefs.getLong("runtime_ms", 0L) + runtimeAccMs
-                         prefs.edit().putLong("runtime_ms", total).apply()
-                         runtimeAccMs = 0L
-                     }
                      val pos = controller.currentPosition.coerceAtLeast(0)
 
                      // Pre-drop tension: ramp up during the 10s before the
@@ -427,19 +350,6 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                          _dropTension.value = tension
                      }
 
-                     // Feed the glyph mixtape: progress through the mix
-                     VisualizerBus.mixProgress.value =
-                         if (_duration.value >= MIX_DURATION_THRESHOLD_MS && _duration.value > 0)
-                             (pos.toFloat() / _duration.value).coerceIn(0f, 1f)
-                         else -1f
-
-                     // Persist mix resume position every ~5s
-                     val curId = _currentMediaId.value
-                     if (curId != null && _duration.value >= MIX_DURATION_THRESHOLD_MS &&
-                         now - lastMixPositionSaveMs > 5_000) {
-                         lastMixPositionSaveMs = now
-                         app.nogarbo.leflac.data.PlayStatsStore.savePosition(getApplication(), curId, pos)
-                     }
                      if (timeSinceSeek > 2000) {
                         _position.value = pos
                      }
@@ -774,14 +684,27 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    private fun generateAndSetArtwork(player: Player, mediaItem: MediaItem) {
-        if (mediaItem.mediaMetadata.artworkData != null) return // Already set, prevent loops
+    fun refreshCarArtwork() {
+        val controller = mediaController ?: return
+        val item = controller.currentMediaItem ?: return
+        generateAndSetArtwork(controller, item, force = true)
+    }
+
+    private fun generateAndSetArtwork(player: Player, mediaItem: MediaItem, force: Boolean = false) {
+        if (!force && mediaItem.mediaMetadata.artworkData != null) return // Already set, prevent loops
         
         val trackTitle = mediaItem.mediaMetadata.title?.toString() ?: "Unknown"
         val trackArtist = mediaItem.mediaMetadata.artist?.toString() ?: "Unknown"
 
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             val context = getApplication<Application>()
+            val scheme = app.nogarbo.leflac.data.AndroidAutoVisualScheme.read(context)
+            val isPocket = scheme == app.nogarbo.leflac.data.AndroidAutoVisualScheme.POCKET
+            val backgroundColor = android.graphics.Color.parseColor(if (isPocket) "#8B9B74" else "#F3F0E6")
+            val gridColor = android.graphics.Color.parseColor(if (isPocket) "#7A8B60" else "#E0DED5")
+            val inkColor = android.graphics.Color.parseColor(if (isPocket) "#1A2F1A" else "#333333")
+            val titleColor = android.graphics.Color.parseColor(if (isPocket) "#1A2F1A" else "#FF4400")
+            val secondaryColor = android.graphics.Color.parseColor(if (isPocket) "#1A2F1A" else "#008B8B")
             
             // 16:9 ratio, wide enough to allow good text scaling
             val width = 1024
@@ -790,11 +713,11 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             val canvas = Canvas(bitmap)
             
             // Aged GameBoy LCD flat background color
-            canvas.drawColor(android.graphics.Color.parseColor("#8B9B74"))
+            canvas.drawColor(backgroundColor)
 
             // LCD Pixel Grid Pattern
             val gridPaint = Paint().apply {
-                color = android.graphics.Color.parseColor("#7A8B60") // Slightly darker green
+                color = gridColor
                 strokeWidth = 2f
             }
             val gridSize = 8f
@@ -813,7 +736,11 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             val vignettePaint = Paint().apply {
                 shader = android.graphics.RadialGradient(
                     width / 2f, height / 2f, width * 0.8f,
-                    intArrayOf(android.graphics.Color.TRANSPARENT, android.graphics.Color.parseColor("#331A2F1A")),
+                    intArrayOf(
+                        android.graphics.Color.TRANSPARENT,
+                        if (isPocket) android.graphics.Color.parseColor("#331A2F1A")
+                        else android.graphics.Color.parseColor("#22000000")
+                    ),
                     null,
                     android.graphics.Shader.TileMode.CLAMP
                 )
@@ -828,12 +755,18 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             }
 
             val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = android.graphics.Color.parseColor("#1A2F1A") // Dark greenish-black LCD pixels
+                color = inkColor
                 typeface = pixelTypeface
                 textAlign = Paint.Align.CENTER
                 isFakeBoldText = true
                 // Subtle LCD ghosting / glass reflection
-                setShadowLayer(6f, 2f, 2f, android.graphics.Color.parseColor("#441A2F1A"))
+                setShadowLayer(
+                    6f,
+                    2f,
+                    2f,
+                    if (isPocket) android.graphics.Color.parseColor("#441A2F1A")
+                    else android.graphics.Color.parseColor("#33000000")
+                )
             }
 
             val centerX = width / 2f
@@ -843,12 +776,14 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
             // Draw rail indicator if RNG is latched.
             if (_isShuffleEnabled.value) {
+                paint.color = secondaryColor
                 paint.textSize = height * 0.08f
                 paint.textAlign = Paint.Align.CENTER
                 canvas.drawText("[ RAIL RNG ]", centerX, padding, paint)
             }
             
             // Dynamic Font Sizing for Title
+            paint.color = titleColor
             var titleSize = height * 0.20f
             paint.textSize = titleSize
             while (paint.measureText(trackTitle) > maxTextWidth && titleSize > 20f) {
@@ -860,6 +795,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             canvas.drawText(trackTitle, centerX, centerY, paint)
             
             // Dynamic Font Sizing for Artist
+            paint.color = secondaryColor
             paint.isFakeBoldText = false
             var artistSize = height * 0.12f
             paint.textSize = artistSize
@@ -897,8 +833,6 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     override fun onCleared() {
         super.onCleared()
-        // Don't lose the in-flight listen credit when the app goes away
-        settlePlayCredit()
         mediaController?.release()
     }
 

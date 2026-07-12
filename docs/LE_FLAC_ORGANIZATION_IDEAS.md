@@ -57,6 +57,7 @@ Contains:
 - Command legend.
 - DIP switches.
 - Skin mode.
+- Android Auto car skin (independent, POCKET by default).
 - Voice.
 - Serial number.
 - Runtime.
@@ -387,6 +388,13 @@ Use for persistent settings:
 - Glyph behavior.
 
 These are "set and leave" controls.
+
+The two skin switches have deliberately different scope. `SKIN` controls the
+phone faceplate and may follow phone brightness in AUTO. `CAR SKIN` controls
+app-owned Android Auto browse and transport artwork; it must never inherit the
+phone's brightness sensor. Android Auto owns final dashboard chrome and may
+ignore grid/list hints, so this switch cannot promise a custom dashboard
+template. See [ANDROID_AUTO.md](ANDROID_AUTO.md).
 
 ### Ledger Rows
 

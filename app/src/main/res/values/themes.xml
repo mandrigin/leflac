@@ -6,4 +6,11 @@
     </style>
 
     <style name="Theme.NothingFLACPlayer" parent="Base.Theme.NothingFLACPlayer" />
+
+    <!-- Android Auto may use this as its static host accent. App-owned art is
+         selected dynamically by the CAR SKIN rear-panel setting. -->
+    <style name="Theme.LeFlac.Car" parent="android:style/Theme.DeviceDefault.DayNight">
+        <item name="android:colorAccent">@color/car_pocket_glass</item>
+        <item name="android:windowBackground">@color/car_pocket_ink</item>
+    </style>
 </resources>

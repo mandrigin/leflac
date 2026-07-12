@@ -9,7 +9,8 @@ LE FLAC is a local-only music player that behaves like a piece of field
 equipment: it analyses every track it touches, knows where the drops are
 before they arrive, keeps a clock on its sleep screen, prints its manual
 and its own circuit diagram on the back of the chassis, and runs a 25×25
-LED cassette deck on the Glyph Matrix.
+LED cassette deck on the Glyph Matrix. LF-1 1.1 also becomes a projected,
+browsable Android Auto media source without adding a network permission.
 
 <p align="center">
   <img src="docs/faceplate-song.png" width="300" alt="FIELD skin — a song on the deck">
@@ -41,8 +42,9 @@ had it.
 | MATRIX | 25×25 Glyph: turntable, cassette, sleeping ampelmann, punch-in shutter, plate clock |
 | ANALYSIS | full-track FFT at import · epic-segment detection · cue extraction · BPM · drive profiling |
 | MEMORY | play/skip stats with 45-day half-life · mix resume positions · lifetime runtime, etched on the chassis |
+| CAR DECK | Android Auto browse · host voice requests · resume · steering-wheel transport · POCKET artwork by default, FIELD selectable |
 | DISPLAY DRIVER | AGSL CRT raster: scanline tear, phosphor lines, periodic magnet pass with degauss snap-back |
-| REQUIRES | Android 14+ · a Nothing Phone (3) for the Matrix (everything else works anywhere) |
+| REQUIRES | Android 14+ · a Nothing Phone (3) for the Matrix · a compatible Android Auto host for the car deck |
 
 ---
 
@@ -144,9 +146,9 @@ over. On the back: the operator's manual, silkscreened over the unit's
 real call path.
 
 ```
-   J3·MEDIASTORE ─┐
+   J3·MEDIASTORE ─┐                         J4·ANDROID AUTO
    ┌U1────────┐  ┌U2────────┐  ┌U3────────┐
-   │LIBRARY.VM├──┤ANLYS.REPO├──┤TRK.ANLYZR│      analysis deck
+   │LOCAL.LIB ├──┤ANLYS.REPO├──┤TRK.ANLYZR│      analysis deck
    └──────────┘  └──────────┘  └─┬──┬──┬──┘
    ┌U4──────┐  ┌X1─────┐  ┌U5────┴┐ ┌┴U6───────┐
    │FLAC.DEC│  │FASTFFT│  │PROFILE│ │PLAYSTATS │
@@ -155,15 +157,18 @@ real call path.
    J1·AUDIOFLINGER ─┐
    ┌U7───────┐  ┌U8───────┐  ┌U9──────┐  ┌U10────┐
    │AUDIO.SVC├──┤EXOPLAYER├──┤PLYB.BUS├──┤PLYB.VM│  playback deck
+   │    └──── MEDIA.LIBRARY SESSION ──────────── J4│
    └─────────┘  └─────────┘  └───┬────┘  └───────┘
    ┌U11──────┐  ┌U12─────┐  ┌U13─┴─────┐
    │GLYPH.SVC├──┤PHOSPHOR├──┤P3.ENGINE ├── J2·GLYPH 25×25
    └─────────┘  └────────┘  └──────────┘
 ```
 
-DIP switches for skin override and machine voice. A serial number minted
-on first run. Your lifetime listening hours, etched. First launch opens
-on the back, because unboxing means reading the manual.
+DIP switches for phone skin override, Android Auto car skin, and machine
+voice. The car defaults independently to POCKET so phone brightness can
+never change the dashboard personality. A serial number is minted on first
+run. Your lifetime listening hours are etched. First launch opens on the
+back, because unboxing means reading the manual.
 
 ## FIELD / POCKET
 
@@ -174,6 +179,30 @@ the FIELD skin — a passive matrix doesn't bend near a magnet, so
 POCKET's title ghosts like slow pixels instead. Hardware conditions,
 not styles.
 
+## ANDROID AUTO / HONDA e
+
+Android Auto sees LF-1 as an offline Media3 library with up to four parked-safe
+destinations: **Hot now**, **Albums**, **Mixes**, and **All songs**. Selecting
+a song builds a songs-only queue; selecting a mix builds a mixes-only queue,
+preserving the unit's existing separation. Voice requests delivered by the host
+are resolved against local media; the first Honda e voice run remains a live
+acceptance check.
+
+The head unit owns its typography, chrome, and final layout. `CAR SKIN` on
+the rear panel therefore controls the parts LE FLAC is allowed to own:
+browse/now-playing artwork and content-style hints. It defaults to **POCKET**;
+**FIELD** uses the beige/orange/cyan instrument palette. Hosts may override
+layout hints, but playback and browsing do not depend on them. Because Android
+shares one media session between the car and system controls, this artwork can
+also appear in the phone's notification/lock-screen media card; the Compose
+faceplate itself remains on its independent `SKIN` setting.
+
+For the first Honda e test, install and open LE FLAC once, grant **Music and
+audio**, then connect while parked using the Android Auto data USB port and
+a certified data cable. Sideloaded builds require Android Auto developer mode
+and **Unknown sources**. The complete live-car checklist and DHU commands are
+in [`docs/ANDROID_AUTO.md`](docs/ANDROID_AUTO.md).
+
 ## OPERATING
 
 ```sh
@@ -181,12 +210,19 @@ scripts/fetch_glyph_sdk.sh  # one-time: pull the Glyph Matrix SDK from
                             # Nothing's official developer kit (their
                             # license forbids us bundling it)
 make run                    # build, install, launch on a connected phone
+make install-phone          # same-key upgrade; preserves library/settings
 make build                  # assemble the APK
 ./gradlew testDebugUnitTest # the test bench
 scripts/push_music.sh DIR   # push a folder of music to the device
 ```
 
-No prebuilt APKs yet — the unit is built from source. It needs a local
+The exact phone-tested sideload build is attached to the
+[v1.1.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.1.0).
+That APK uses the development/debug signing key and is intended for direct
+testing, not store distribution. Upgrade preservation requires the installed
+copy to use the same signing key. Version 1.1.0 uses Media3 1.10.1 and API 36
+build tooling while retaining target SDK 34 for the initial sideloaded Honda e
+validation. It needs a local
 music library (it scans MediaStore) and, for the full experience, a
 Nothing Phone (3) with the Glyph Matrix. Add LE FLAC as a Glyph Toy in
 settings; long-press is the only transport gesture, by design. The
@@ -215,7 +251,7 @@ Third-party parts on the board:
 | PART | ORIGIN | TERMS |
 |---|---|---|
 | Glyph Matrix SDK | © Nothing Technology Limited | Nothing's developer terms — no redistribution, so it is **not** in this repo; `scripts/fetch_glyph_sdk.sh` pulls it from [the official developer kit](https://github.com/Nothing-Developer-Programme/GlyphMatrix-Developer-Kit) |
-| Media3 · AndroidX · Gson | Google | Apache-2.0 |
+| Media3 1.10.1 · AndroidX · Gson | Google | Apache-2.0 |
 | JTransforms | Piotr Wendykier | BSD-2 |
 | VT323 (`lcd_font`) | Peter Hull | SIL OFL 1.1 |
 | Press Start 2P (`pixel_font`) | CodeMan38 | SIL OFL 1.1 |

@@ -1,5 +1,12 @@
 # LE FLAC Product, UI, and UX Audit
 
+> **LF-1 1.1 update:** projected Android Auto is now a separate host-rendered
+> surface. Its rear-panel `CAR SKIN` switch defaults to POCKET and changes
+> app-owned browser/now-playing artwork without changing the phone faceplate's
+> brightness-driven skin. Android Auto controls final typography and chrome.
+> Implementation and Honda e acceptance details are in
+> [ANDROID_AUTO.md](ANDROID_AUTO.md).
+
 Date: 2026-06-11  
 Scope: local repo review, `screen.png`, `screen2.png`, README, primary Compose UI, theme, library, scrubber, and rear panel code.
 

@@ -1,11 +1,10 @@
 package app.nogarbo.leflac.ui.library
 
 import android.app.Application
-import android.content.ContentUris
-import android.provider.MediaStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.nogarbo.leflac.data.AudioTrack
+import app.nogarbo.leflac.data.LocalAudioLibrary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,100 +46,11 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     fun scanLibrary() {
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
-                
-                // Compatibility for API 28 (Pie) which lacks BUCKET_DISPLAY_NAME
-                val useBucketId = android.os.Build.VERSION.SDK_INT >= 29
-                
-                val projection = if (useBucketId) {
-                    arrayOf(
-                        MediaStore.Audio.Media._ID,
-                        MediaStore.Audio.Media.TITLE,
-                        MediaStore.Audio.Media.ARTIST,
-                        MediaStore.Audio.Media.DURATION,
-                        MediaStore.Audio.Media.DURATION,
-                        MediaStore.Audio.Media.BUCKET_DISPLAY_NAME,
-                        MediaStore.Audio.Media.SIZE,
-                        MediaStore.Audio.Media.MIME_TYPE
-                    )
-                } else {
-                     arrayOf(
-                        MediaStore.Audio.Media._ID,
-                        MediaStore.Audio.Media.TITLE,
-                        MediaStore.Audio.Media.ARTIST,
-                        MediaStore.Audio.Media.DURATION,
-                        MediaStore.Audio.Media.DATA, // Fallback: Absolute Path
-                        MediaStore.Audio.Media.SIZE,
-                        MediaStore.Audio.Media.MIME_TYPE
-                    )
-                }
-                
-                // Only audio files and longer than 1 minute (60,000 ms), unless it's a FLAC file
-                val selection = "${MediaStore.Audio.Media.IS_MUSIC} != 0 AND (${MediaStore.Audio.Media.DURATION} >= 60000 OR ${MediaStore.Audio.Media.MIME_TYPE} LIKE '%flac%' OR ${MediaStore.Audio.Media.DATA} LIKE '%.flac')"
-                val sortOrder = if (useBucketId) "${MediaStore.Audio.Media.BUCKET_DISPLAY_NAME} ASC" else null
-
-                val cursor = getApplication<Application>().contentResolver.query(
-                    collection,
-                    projection,
-                    selection,
-                    null,
-                    sortOrder
-                )
-
-                val tempTracks = mutableListOf<AudioTrack>()
-                val tempFolders = mutableSetOf<String>()
-
-                cursor?.use {
-                    val idCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
-                    val titleCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
-                    val artistCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
-                    val durationCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
-                    
-                    val sizeCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
-                    val mimeCol = it.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE)
-                    
-                    // Column index depends on version
-                    val bucketCol = if (useBucketId) 
-                        it.getColumnIndexOrThrow(MediaStore.Audio.Media.BUCKET_DISPLAY_NAME)
-                    else 
-                        it.getColumnIndexOrThrow(MediaStore.Audio.Media.DATA)
-
-                    while (it.moveToNext()) {
-                        val id = it.getLong(idCol)
-                        val title = it.getString(titleCol)
-                        val artist = it.getString(artistCol)
-                        val duration = it.getLong(durationCol)
-                        val size = it.getLong(sizeCol)
-                        val mime = it.getString(mimeCol) ?: "audio/*"
-                        
-                        var bucket = "Unknown"
-                        if (useBucketId) {
-                            bucket = it.getString(bucketCol) ?: "Unknown"
-                        } else {
-                            // Extract folder from path manually
-                            val path = it.getString(bucketCol)
-                            if (path != null) {
-                                val file = java.io.File(path)
-                                bucket = file.parentFile?.name ?: "Root"
-                            }
-                        }
-
-                        val uri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id)
-
-                        tempTracks.add(AudioTrack(id, title, artist, duration, uri, bucket, size, mime))
-                        tempFolders.add(bucket)
-                    }
-                }
-                
-                // Separation Logic: Mixes vs Albums
-                // Mix > 20 mins (1,200,000 ms)
-                val MIX_THRESHOLD = 20 * 60 * 1000L
-                
-                val allTracks = tempTracks
-                val mixTracks = allTracks.filter { it.duration >= MIX_THRESHOLD }
-                val standardTracks = allTracks.filter { it.duration < MIX_THRESHOLD }
-                
-                val albumFolders = standardTracks.map { it.folderName }.distinct().sorted()
+                val snapshot = LocalAudioLibrary(getApplication()).load()
+                val allTracks = snapshot.allTracks
+                val mixTracks = snapshot.mixes
+                val standardTracks = snapshot.songs
+                val albumFolders = snapshot.folders
                 
                 // Update state
                 // Update state

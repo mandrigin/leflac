@@ -70,6 +70,9 @@ class MainActivity : ComponentActivity() {
             // Rear-panel DIP switches: skin override and machine voice
             val devicePrefs = remember { getSharedPreferences("flac_prefs", MODE_PRIVATE) }
             var themeMode by remember { mutableStateOf(devicePrefs.getInt("theme_mode", 0)) } // 0 AUTO, 1 FIELD, 2 POCKET
+            var androidAutoVisualScheme by remember {
+                mutableStateOf(app.nogarbo.leflac.data.AndroidAutoVisualScheme.read(this@MainActivity))
+            }
             var voiceOn by remember { mutableStateOf(devicePrefs.getBoolean("ui_voice", false)) }
             LaunchedEffect(voiceOn) { app.nogarbo.leflac.util.MachineVoice.enabled = voiceOn }
             val isDark = when (themeMode) { 1 -> false; 2 -> true; else -> isLowBrightness }
@@ -95,7 +98,8 @@ class MainActivity : ComponentActivity() {
                     onResult = { permissions ->
                         hasPermission = permissions.containsValue(false).not()
                         if (hasPermission) {
-                            // Ideally, trigger ViewModel scan here
+                            app.nogarbo.leflac.service.AudioService.instance
+                                ?.refreshLocalAudioLibrary()
                         }
                     }
                 )
@@ -676,12 +680,14 @@ class MainActivity : ComponentActivity() {
                                        val startIndex = if (isShuffleEnabled) 0 else playlist.indexOf(track).coerceAtLeast(0)
 
                                        val intent = Intent(context, app.nogarbo.leflac.service.AudioService::class.java)
-                                       intent.action = "PLAY_LIST"
+                                       intent.action = app.nogarbo.leflac.service.AudioCommandBus.ACTION_PLAY_LIST
                                        intent.putParcelableArrayListExtra("URIS", uris)
                                        intent.putStringArrayListExtra("TITLES", titles)
                                        intent.putStringArrayListExtra("ARTISTS", artists)
                                        intent.putExtra("START_INDEX", startIndex)
-                                       context.startForegroundService(intent)
+                                       context.startForegroundService(
+                                           app.nogarbo.leflac.service.AudioCommandBus.authorize(intent)
+                                       )
                                   }
                              )
                         } else {
@@ -780,6 +786,17 @@ class MainActivity : ComponentActivity() {
                                 onThemeModeChange = {
                                     themeMode = it
                                     devicePrefs.edit().putInt("theme_mode", it).apply()
+                                },
+                                androidAutoVisualScheme = androidAutoVisualScheme,
+                                onAndroidAutoVisualSchemeChange = { scheme ->
+                                    androidAutoVisualScheme = scheme
+                                    app.nogarbo.leflac.data.AndroidAutoVisualScheme.write(
+                                        this@MainActivity,
+                                        scheme
+                                    )
+                                    app.nogarbo.leflac.service.AudioService.instance
+                                        ?.notifyAndroidAutoVisualSchemeChanged()
+                                    playbackViewModel.refreshCarArtwork()
                                 },
                                 voiceOn = voiceOn,
                                 onVoiceChange = {
