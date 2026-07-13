@@ -2,8 +2,8 @@ package app.nogarbo.leflac
 
 import android.os.Bundle
 import android.content.Intent
-import android.content.pm.PackageManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -17,9 +17,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Alignment
@@ -27,11 +29,14 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
 import androidx.compose.ui.zIndex
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import app.nogarbo.leflac.ui.theme.ChassisBeige
 import app.nogarbo.leflac.ui.theme.FieldTheme
@@ -40,6 +45,13 @@ import app.nogarbo.leflac.ui.theme.SafetyOrange
 
 @androidx.compose.foundation.ExperimentalFoundationApi
 class MainActivity : ComponentActivity() {
+    private val resumeGeneration = kotlinx.coroutines.flow.MutableStateFlow(0L)
+
+    override fun onResume() {
+        super.onResume()
+        resumeGeneration.value += 1L
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
@@ -61,9 +73,10 @@ class MainActivity : ComponentActivity() {
                 contentResolver.unregisterContentObserver(observer)
             }
         }
+        val initialBrightness = getSystemBrightness(applicationContext.contentResolver)
 
         setContent {
-            val brightness by brightnessFlow.collectAsState(initial = 255) // Default to max
+            val brightness by brightnessFlow.collectAsState(initial = initialBrightness)
             // Low brightness threshold: 25% of 255 is approx 64.
             val isLowBrightness = brightness < 64
 
@@ -81,50 +94,49 @@ class MainActivity : ComponentActivity() {
                 // ... rest of content ...
                 val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
                 val context = LocalContext.current
+                val playbackViewModel: app.nogarbo.leflac.ui.viewmodel.PlaybackViewModel = viewModel()
+                val libraryViewModel: app.nogarbo.leflac.ui.library.LibraryViewModel = viewModel()
+                val permissionLibrary = remember(context) {
+                    app.nogarbo.leflac.data.LocalAudioLibrary(context)
+                }
+                DisposableEffect(permissionLibrary) {
+                    onDispose(permissionLibrary::close)
+                }
                 var hasPermission by remember {
-                    mutableStateOf(
-                        ContextCompat.checkSelfPermission(
-                            context,
-                            if (android.os.Build.VERSION.SDK_INT >= 33) 
-                                android.Manifest.permission.READ_MEDIA_AUDIO
-                            else 
-                                android.Manifest.permission.READ_EXTERNAL_STORAGE
-                        ) == PackageManager.PERMISSION_GRANTED
+                    mutableStateOf(permissionLibrary.hasAudioPermission())
+                }
+
+                fun synchronizeAudioPermission() {
+                    val transition = app.nogarbo.leflac.data.audioPermissionTransition(
+                        previousGranted = hasPermission,
+                        actualGranted = permissionLibrary.hasAudioPermission()
                     )
+                    if (transition.changed) {
+                        hasPermission = transition.granted
+                        app.nogarbo.leflac.service.AudioService.instance
+                            ?.refreshLocalAudioLibrary()
+                    }
                 }
 
                 val launcher = rememberLauncherForActivityResult(
                     contract = ActivityResultContracts.RequestMultiplePermissions(),
-                    onResult = { permissions ->
-                        hasPermission = permissions.containsValue(false).not()
-                        if (hasPermission) {
-                            app.nogarbo.leflac.service.AudioService.instance
-                                ?.refreshLocalAudioLibrary()
-                        }
+                    onResult = {
+                        // The result map may be empty when the system cancels the
+                        // prompt, so the package permission is the source of truth.
+                        synchronizeAudioPermission()
                     }
                 )
-
-                LaunchedEffect(Unit) {
-                    if (!hasPermission) {
-                        launcher.launch(
-                            if (android.os.Build.VERSION.SDK_INT >= 33) 
-                                arrayOf(android.Manifest.permission.READ_MEDIA_AUDIO)
-                            else 
-                                arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-                        )
-                    }
-                }
-
-                val playbackViewModel: app.nogarbo.leflac.ui.viewmodel.PlaybackViewModel = viewModel()
-                val libraryViewModel: app.nogarbo.leflac.ui.library.LibraryViewModel = viewModel()
+                val resumed by resumeGeneration.collectAsState()
+                LaunchedEffect(resumed) { synchronizeAudioPermission() }
                 val isPlaying by playbackViewModel.isPlaying.collectAsState()
                 val duration by playbackViewModel.duration.collectAsState()
                 val spectrum by playbackViewModel.spectrum.collectAsState()
                 val isShuffleEnabled by playbackViewModel.isShuffleEnabled.collectAsState()
                 val currentMediaId by playbackViewModel.currentMediaId.collectAsState()
                 val upNext by playbackViewModel.upNext.collectAsState()
-                val mixes by libraryViewModel.mixes.collectAsState()
-                val isMixPlaying = currentMediaId != null && mixes.any { it.uri.toString() == currentMediaId }
+                val hasMedia = currentMediaId != null
+                val isMixPlaying = hasMedia &&
+                    duration >= app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS
 
                 // Headphone Detection (Bluetooth + Wired)
                 var isHeadphonesConnected by remember { mutableStateOf(false) }
@@ -151,14 +163,24 @@ class MainActivity : ComponentActivity() {
                 
                 // Flip-to-rear: the manual is printed on the back of the unit.
                 // First run opens on the back — unboxing means reading the manual.
-                var rearVisible by remember {
-                    mutableStateOf(devicePrefs.getBoolean("first_run_rear", true))
+                val firstRunRear = remember {
+                    devicePrefs.getBoolean("first_run_rear", true)
                 }
-                LaunchedEffect(Unit) {
-                    if (devicePrefs.getBoolean("first_run_rear", true)) {
+                var rearVisible by rememberSaveable {
+                    mutableStateOf(firstRunRear)
+                }
+                var firstRunRearPending by rememberSaveable { mutableStateOf(firstRunRear) }
+                // The ledger moves between two different layout slots when the
+                // Activity is recreated for rotation. Give its nested
+                // rememberSaveable values one stable registry key so selection,
+                // search, album, tab, and shelf scroll state follow the ledger.
+                val ledgerStateHolder =
+                    androidx.compose.runtime.saveable.rememberSaveableStateHolder()
+                fun closeRear() {
+                    rearVisible = false
+                    if (firstRunRearPending) {
                         devicePrefs.edit().putBoolean("first_run_rear", false).apply()
-                        kotlinx.coroutines.delay(5_000)
-                        rearVisible = false
+                        firstRunRearPending = false
                     }
                 }
 
@@ -173,6 +195,23 @@ class MainActivity : ComponentActivity() {
                         app.nogarbo.leflac.util.MachineVoice.boot()
                         kotlinx.coroutines.delay(950)
                         booting = false
+                    }
+                }
+
+                // Let the first-run manual and self-test finish before Android
+                // presents the permission sheet. A denial is not re-prompted in
+                // a loop; the ledger offers a parked-safe Settings route.
+                LaunchedEffect(hasPermission, rearVisible, booting) {
+                    if (!hasPermission && !rearVisible && !booting) {
+                        // Let the 650ms physical flip finish before the system
+                        // permission sheet covers the newly visible front.
+                        kotlinx.coroutines.delay(650L)
+                        launcher.launch(
+                            if (android.os.Build.VERSION.SDK_INT >= 33)
+                                arrayOf(android.Manifest.permission.READ_MEDIA_AUDIO)
+                            else
+                                arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+                        )
                     }
                 }
 
@@ -230,12 +269,17 @@ class MainActivity : ComponentActivity() {
 
                         // Racked sideways the unit becomes a desk deck: faceplate
                         // and transport on the left, the ledger as a side panel.
-                        val isLandscape = androidx.compose.ui.platform.LocalConfiguration.current.orientation ==
-                            android.content.res.Configuration.ORIENTATION_LANDSCAPE
+                        val windowConfiguration = androidx.compose.ui.platform.LocalConfiguration.current
+                        val isLandscape =
+                            windowConfiguration.orientation ==
+                                android.content.res.Configuration.ORIENTATION_LANDSCAPE &&
+                            windowConfiguration.screenWidthDp >= 500 &&
+                            windowConfiguration.screenHeightDp >= 300
 
                         // ZONE 1 — SYSTEM STRIP: nameplate, mode, rail, glyph state, time
                         SystemStrip(
                             isPocket = skin.isLcd,
+                            hasMedia = hasMedia,
                             isPlaying = isPlaying,
                             isMixPlaying = isMixPlaying,
                             isShuffleEnabled = isShuffleEnabled,
@@ -324,6 +368,8 @@ class MainActivity : ComponentActivity() {
                                         spectrum = effectiveSpectrum,
                                         idle = !isPlaying,
                                         straining = analysisProgress < 0.97f,
+                                        maxLines = 2,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                                         modifier = Modifier
                                     )
 
@@ -390,7 +436,11 @@ class MainActivity : ComponentActivity() {
                                             color = if (isCurrent) skin.accent else skin.dim,
                                             maxLines = 1,
                                             modifier = Modifier
-                                                .clickable { playbackViewModel.seekTo(ms) }
+                                                .clickable(
+                                                    role = Role.Button,
+                                                    onClickLabel = "Seek to cue $n at ${cueTime(ms)}",
+                                                    onClick = { playbackViewModel.seekTo(ms) }
+                                                )
                                                 .padding(vertical = 2.dp)
                                         )
                                     }
@@ -409,6 +459,7 @@ class MainActivity : ComponentActivity() {
                                 "K:${(spectrum.kick * 10).toInt()} B:${(spectrum.bassGuitar * 10).toInt()} S:${(spectrum.snare * 10).toInt()} G:${(spectrum.guitar * 10).toInt()} V:${(spectrum.vocal * 10).toInt()} Y:${(spectrum.synth * 10).toInt()} C:${(spectrum.cymbals * 10).toInt()}"
                             }
                             val faceState = when {
+                                !hasMedia -> "STANDBY"
                                 analysisProgress < 0f -> "ANALYSIS FAILED"
                                 analysisProgress < 0.97f -> "ANALYZING ${(analysisProgress * 100).toInt()}%"
                                 isMixPlaying -> "MIX MAP"
@@ -524,6 +575,7 @@ class MainActivity : ComponentActivity() {
                                 // TRANSPORT CONTROLS
                                 val globalPunchInAnimatable = remember { androidx.compose.animation.core.Animatable(0f) }
                                 val scope = androidx.compose.runtime.rememberCoroutineScope()
+                                var activePunchSource by remember { mutableStateOf<String?>(null) }
                                 val transportLabelStyle = androidx.compose.material3.MaterialTheme.typography.labelSmall.copy(
                                     fontSize = 9.sp,
                                     letterSpacing = 0.sp,
@@ -552,6 +604,8 @@ class MainActivity : ComponentActivity() {
                                     // PREV
                                     app.nogarbo.leflac.ui.components.IsometricButton(
                                         text = prevLabel,
+                                        onClickLabel = if (isMixPlaying) "Previous cue" else "Previous track",
+                                        onLongClickLabel = "Previous file in library order",
                                         onClick = {
                                             if (isMixPlaying || !isShuffleEnabled) {
                                                 playbackViewModel.playPreviousSequential(libraryViewModel.allTracks.value)
@@ -560,9 +614,11 @@ class MainActivity : ComponentActivity() {
                                             }
                                         },
                                         onLongClick = {
+                                            activePunchSource = "PREV"
                                             scope.launch {
                                                 globalPunchInAnimatable.snapTo(1f)
                                                 globalPunchInAnimatable.animateTo(0f, animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.LinearOutSlowInEasing))
+                                                if (activePunchSource == "PREV") activePunchSource = null
                                             }
                                             playbackViewModel.playPreviousSequentialFile(libraryViewModel.allTracks.value)
                                         },
@@ -572,7 +628,8 @@ class MainActivity : ComponentActivity() {
                                         bassLevel = spectrum.bass,
                                         textStyle = transportLabelStyle,
                                         globalPunchIn = globalPunchInAnimatable.value,
-                                        isPunchInSource = true
+                                        isPunchInSource = activePunchSource == "PREV",
+                                        isPunchInCapable = true
                                     )
 
                                     Spacer(modifier = Modifier.width(12.dp))
@@ -580,6 +637,8 @@ class MainActivity : ComponentActivity() {
                                     // PLAY / PAUSE — the loudest control says its name
                                     app.nogarbo.leflac.ui.components.IsometricButton(
                                         text = if (isPlaying) "PAUSE" else "PLAY",
+                                        onClickLabel = if (isPlaying) "Pause playback" else "Start playback",
+                                        enabled = hasMedia,
                                         onClick = { playbackViewModel.togglePlayPause() },
                                         size = 64.dp,
                                         baseColor = skin.accent,
@@ -610,6 +669,8 @@ class MainActivity : ComponentActivity() {
                                         ) {
                                             app.nogarbo.leflac.ui.components.IsometricButton(
                                                 text = nextLabel,
+                                                onClickLabel = if (isMixPlaying) "Next cue" else "Next track",
+                                                onLongClickLabel = "Next file in library order",
                                                 onClick = {
                                                     if (isMixPlaying) {
                                                         playbackViewModel.playNextSequential(libraryViewModel.allTracks.value)
@@ -620,9 +681,11 @@ class MainActivity : ComponentActivity() {
                                                     }
                                                 },
                                                 onLongClick = {
+                                                    activePunchSource = "NEXT"
                                                     scope.launch {
                                                         globalPunchInAnimatable.snapTo(1f)
                                                         globalPunchInAnimatable.animateTo(0f, animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.LinearOutSlowInEasing))
+                                                        if (activePunchSource == "NEXT") activePunchSource = null
                                                     }
                                                     playbackViewModel.playNextSequentialFile(libraryViewModel.allTracks.value)
                                                 },
@@ -631,13 +694,16 @@ class MainActivity : ComponentActivity() {
                                                 contentColor = neutralContent,
                                                 bassLevel = spectrum.bass,
                                                 textStyle = transportLabelStyle,
-                                                globalPunchIn = globalPunchInAnimatable.value
+                                                globalPunchIn = globalPunchInAnimatable.value,
+                                                isPunchInSource = activePunchSource == "NEXT",
+                                                isPunchInCapable = true
                                             )
                                             Spacer(modifier = Modifier.width(12.dp))
                                             // RNG one-shot: a real button, never an empty
                                             // outline — soft cyan face, deck-cyan label.
                                             app.nogarbo.leflac.ui.components.IsometricButton(
                                                 text = "RNG",
+                                                onClickLabel = "Play one random ${if (isMixPlaying) "mix" else "song"}",
                                                 onClick = { playbackViewModel.playNextRandom(libraryViewModel.allTracks.value) },
                                                 size = 48.dp,
                                                 baseColor = if (skin.isLcd) skin.buttonBase
@@ -668,13 +734,13 @@ class MainActivity : ComponentActivity() {
                                   upNext = upNext,
                                   onGymStart = { playbackViewModel.setGymMode(true) },
                                   onTracksQueued = { tracks ->
-                                      val result = playbackViewModel.scheduleUpNext(
+                                      val outcome = playbackViewModel.scheduleUpNext(
                                           tracks,
                                           libraryViewModel.allTracks.value
                                       )
-                                      val message = when (result) {
+                                      val message = when (outcome.result) {
                                           app.nogarbo.leflac.service.ScheduleUpNextResult.ADDED ->
-                                              "UP NEXT · ${tracks.size.toString().padStart(2, '0')}"
+                                              "UP NEXT · ${outcome.changedCount.toString().padStart(2, '0')}"
                                           app.nogarbo.leflac.service.ScheduleUpNextResult.ARMED ->
                                               "DECK ARMED · PRESS PLAY"
                                           app.nogarbo.leflac.service.ScheduleUpNextResult.ALREADY_QUEUED ->
@@ -685,8 +751,14 @@ class MainActivity : ComponentActivity() {
                                               "QUEUE CONTROLLER OFFLINE"
                                       }
                                       android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show()
-                                      result != app.nogarbo.leflac.service.ScheduleUpNextResult.WRONG_POOL &&
-                                          result != app.nogarbo.leflac.service.ScheduleUpNextResult.UNAVAILABLE
+                                      outcome.shouldClearSelection
+                                  },
+                                  onQueueBlocked = { reason ->
+                                      android.widget.Toast.makeText(
+                                          context,
+                                          reason,
+                                          android.widget.Toast.LENGTH_SHORT
+                                      ).show()
                                   },
                                   onUpNextRemoved = playbackViewModel::removeFromUpNext,
                                   onUpNextCleared = playbackViewModel::clearUpNext,
@@ -722,18 +794,21 @@ class MainActivity : ComponentActivity() {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .clickable {
-                                        // Deliver on the promise: open this app's settings page
-                                        val intent = Intent(
-                                            android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                                            android.net.Uri.fromParts("package", context.packageName, null)
-                                        )
-                                        context.startActivity(intent)
-                                    },
+                                    .clickable(
+                                        role = Role.Button,
+                                        onClickLabel = "Open app settings for Music access",
+                                        onClick = {
+                                            val intent = Intent(
+                                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                                android.net.Uri.fromParts("package", context.packageName, null)
+                                            )
+                                            context.startActivity(intent)
+                                        }
+                                    ),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
-                                    text = "ACCESS DENIED\n[TAP SETTINGS]",
+                                    text = "MUSIC ACCESS REQUIRED\n[TAP SETTINGS]",
                                     style = androidx.compose.material3.MaterialTheme.typography.displayMedium,
                                     color = skin.accent,
                                     textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -757,13 +832,17 @@ class MainActivity : ComponentActivity() {
                                         .background(skin.dim)
                                 )
                                 Box(modifier = Modifier.weight(0.44f)) {
-                                    ledgerZone()
+                                    ledgerStateHolder.SaveableStateProvider("library-ledger") {
+                                        ledgerZone()
+                                    }
                                 }
                             }
                         } else {
                             faceplateZone(Modifier.height(200.dp))
                             transportZone()
-                            ledgerZone()
+                            ledgerStateHolder.SaveableStateProvider("library-ledger") {
+                                ledgerZone()
+                            }
                         }
                     }
 
@@ -801,6 +880,11 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    // Registered after the ledger handlers so Back always
+                    // returns the physical unit to its front before changing
+                    // search, selection, or album state behind it.
+                    BackHandler(enabled = rearVisible, onBack = ::closeRear)
+
                     // REAR OF THE UNIT (visible past 90 degrees of flip)
                     if (flipAngle > 90f) {
                         Box(
@@ -831,7 +915,7 @@ class MainActivity : ComponentActivity() {
                                     voiceOn = it
                                     devicePrefs.edit().putBoolean("ui_voice", it).apply()
                                 },
-                                onTap = { rearVisible = false }
+                                onTap = ::closeRear
                             )
                         }
                     }
@@ -853,6 +937,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun SystemStrip(
     isPocket: Boolean,
+    hasMedia: Boolean,
     isPlaying: Boolean,
     isMixPlaying: Boolean,
     isShuffleEnabled: Boolean,
@@ -865,8 +950,14 @@ fun SystemStrip(
     val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
     val statusTime by androidx.compose.runtime.produceState(initialValue = "") {
         while (true) {
-            value = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
-            kotlinx.coroutines.delay(30_000)
+            val now = System.currentTimeMillis()
+            value = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
+                .format(java.util.Date(now))
+            // Wake on the next minute boundary so the engraved clock cannot
+            // trail the system status bar for nearly 30 seconds.
+            kotlinx.coroutines.delay(
+                (60_000L - (now % 60_000L)).coerceIn(100L, 60_000L)
+            )
         }
     }
     val stripStyle = androidx.compose.material3.MaterialTheme.typography.labelSmall.copy(
@@ -895,7 +986,11 @@ fun SystemStrip(
         Box(
             modifier = Modifier
                 .border(1.dp, skin.dim)
-                .clickable(onClick = onNameplate)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Open operator manual",
+                    onClick = onNameplate
+                )
                 .padding(horizontal = 5.dp, vertical = 2.dp)
         ) {
             Text(
@@ -916,7 +1011,13 @@ fun SystemStrip(
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-            text = "${if (isPocket) "POCKET" else "FIELD"} · ${if (isMixPlaying) "MIX" else "SONG"}",
+            text = "${if (isPocket) "POCKET" else "FIELD"} · ${
+                when {
+                    !hasMedia -> "IDLE"
+                    isMixPlaying -> "MIX"
+                    else -> "SONG"
+                }
+            }",
             style = stripStyle,
             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
             fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
@@ -931,13 +1032,21 @@ fun SystemStrip(
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
                 color = skin.accent,
                 maxLines = 1,
-                modifier = Modifier.clickable { onGymEnd() }
+                modifier = Modifier.clickable(
+                    role = Role.Button,
+                    onClickLabel = "End gym mode",
+                    onClick = onGymEnd
+                )
             )
         }
         Spacer(modifier = Modifier.weight(1f))
         Text(
             text = "RAIL ${if (isShuffleEnabled) "RNG" else "ORDER"} · ${
-                if (cueIndex >= 0) String.format("CUE %02d", cueIndex) else "GLYPH READY"
+                when {
+                    !hasMedia -> "STANDBY"
+                    cueIndex >= 0 -> String.format("CUE %02d", cueIndex)
+                    else -> "GLYPH READY"
+                }
             } · $statusTime",
             style = stripStyle,
             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
@@ -978,10 +1087,20 @@ fun RailLatch(
         modifier = modifier
             .height(20.dp)
             .border(1.dp, skin.dim)
-            .clickable(onClick = onToggle)
+            .toggleable(
+                value = rngOn,
+                role = Role.Switch,
+                onValueChange = { onToggle() }
+            )
+            .semantics {
+                contentDescription = "Playback rail"
+                stateDescription = if (rngOn) "Random" else "Ordered"
+            }
             .padding(2.dp)
     ) {
-        // Engraved position labels on the slot floor
+        // Engraved position labels on the slot floor. Foundation expands the
+        // toggle's pointer hit bounds to the platform minimum without changing
+        // this 20dp painted/measured hardware face.
         Row(modifier = Modifier.fillMaxSize()) {
             Box(
                 modifier = Modifier.weight(1f).fillMaxHeight(),

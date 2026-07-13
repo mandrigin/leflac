@@ -1,7 +1,7 @@
 # LE FLAC Product, UI, and UX Audit
 
 > **LF-1 1.1 update:** projected Android Auto is now a separate host-rendered
-> surface. Its rear-panel `CAR SKIN` switch defaults to POCKET and changes
+> surface. Its independent rear-panel artwork switch defaults to POCKET and changes
 > app-owned browser/now-playing artwork without changing the phone faceplate's
 > brightness-driven skin. Android Auto controls final typography and chrome.
 > Implementation and Honda e acceptance details are in
@@ -11,6 +11,11 @@
 > UP NEXT segment ahead of ORDER/RNG. A fourth ledger tab makes the scheduled
 > order, removal, clear-all, selection state, haptics, and accessibility labels
 > visible without converting the player into a generic modal queue editor.
+
+> **LF-1 1.3 update:** the artwork control is now named `AA ART`, and the rear
+> manual explicitly says Android Auto owns the layout. Permission recovery,
+> Back precedence, saveable queue selection, blocked-hold feedback, touch
+> semantics, and browse-position consistency received the same discipline pass.
 
 Date: 2026-06-11  
 Scope: local repo review, `screen.png`, `screen2.png`, README, primary Compose UI, theme, library, scrubber, and rear panel code.

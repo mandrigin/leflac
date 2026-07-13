@@ -4,6 +4,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -12,6 +15,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -22,13 +26,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
 import app.nogarbo.leflac.ui.skins.LocalFieldSkin
 import app.nogarbo.leflac.data.AndroidAutoVisualScheme
 import androidx.compose.ui.graphics.toArgb
@@ -37,7 +42,8 @@ import androidx.compose.ui.graphics.nativeCanvas
 /**
  * The back of the unit — Pocket Operator style: the manual is printed on
  * the device. Flip it over (tap the LF-1 nameplate), read the legend,
- * tap anywhere to flip back.
+ * tap the chassis, use the explicit FRONT control, or press system Back to
+ * flip forward.
  */
 @Composable
 fun RearPanel(
@@ -78,7 +84,9 @@ fun RearPanel(
         modifier = Modifier
             .fillMaxSize()
             .background(bg)
-            .clickable(onClick = onTap)
+            .pointerInput(onTap) {
+                detectTapGestures(onTap = { onTap() })
+            }
     ) {
         // The board. Chips are filled IC packages with etched part numbers,
         // sitting on a dot-grid substrate; traces run in clear channels.
@@ -229,19 +237,45 @@ fun RearPanel(
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 48.dp, vertical = 24.dp)
         ) {
-            Text(
-                text = "LF-1 — OPERATOR'S MANUAL",
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = FontFamily.Monospace,
-                color = skin.accent
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "LF-1 — OPERATOR'S MANUAL",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = skin.accent,
+                    modifier = Modifier.weight(1f)
+                )
+                Box(
+                    modifier = Modifier
+                        .width(72.dp)
+                        .fillMaxHeight()
+                        .border(1.dp, skin.accent)
+                        .clickable(
+                            role = Role.Button,
+                            onClickLabel = "Return to player",
+                            onClick = onTap
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "[FRONT]",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = skin.accent
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(6.dp))
             Box(modifier = Modifier.fillMaxWidth().height(2.dp).background(ink))
             Spacer(modifier = Modifier.height(14.dp))
 
             ManualRow("[>]", "PLAY / PAUSE")
             ManualRow("[<][>]", "PREV / NEXT — IN A MIX: JUMPS BETWEEN CUES")
-            ManualRow("HOLD [<]", "PUNCH-IN — SEQUENTIAL REWIND + TARGET LOCK")
+            ManualRow("HOLD [<][>]", "PREVIOUS / NEXT FILE + TARGET LOCK")
             ManualRow("RNG", "RANDOM TRACK — RESPECTS SONG/MIX POOLS")
             ManualRow("HOLD TRACK", "SELECT UP NEXT · TAP MORE · [QUEUE]")
             ManualRow("UP NEXT", "PRIORITY BUS — RUNS BEFORE EITHER RAIL")
@@ -250,6 +284,8 @@ fun RearPanel(
             ManualRow("FLAME", "HOT NOW — YOUR CURRENT HEAT", info = true)
             ManualRow("INVERT", "EPIC SEGMENT — UNIT HOLDS BREATH 10S PRIOR", info = true)
             ManualRow("DIM <25%", "POCKET MODE — 2-BIT LCD SKIN", info = true)
+            ManualRow("AA HOST", "ANDROID AUTO OWNS LAYOUT · SWITCH CHANGES ART", info = true)
+            ManualRow("AA SIDELOAD", "DEV MODE · UNKNOWN SOURCES · RECONNECT", info = true)
 
             Spacer(modifier = Modifier.height(14.dp))
 
@@ -270,7 +306,7 @@ fun RearPanel(
             )
             Spacer(modifier = Modifier.height(4.dp))
             DipSwitch(
-                label = "CAR SKIN",
+                label = "AA ART",
                 options = listOf("POCKET", "FIELD"),
                 selectedIndex = if (androidAutoVisualScheme == AndroidAutoVisualScheme.POCKET) 0 else 1,
                 onSelect = {
@@ -303,7 +339,10 @@ fun RearPanel(
 private fun DipSwitch(label: String, options: List<String>, selectedIndex: Int, onSelect: (Int) -> Unit) {
     val skin = LocalFieldSkin.current
     val ink = MaterialTheme.colorScheme.onBackground
-    Row(verticalAlignment = Alignment.CenterVertically) {
+    Row(
+        modifier = Modifier.selectableGroup(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
@@ -316,22 +355,33 @@ private fun DipSwitch(label: String, options: List<String>, selectedIndex: Int, 
             val active = i == selectedIndex
             Box(
                 modifier = Modifier
-                    .border(1.dp, if (active) skin.accent else skin.dim)
-                    .background(if (active) skin.accent else androidx.compose.ui.graphics.Color.Transparent)
-                    .semantics {
-                        selected = active
-                        contentDescription = "$label: $opt"
-                    }
-                    .clickable { onSelect(i) }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                    .height(48.dp)
+                    .selectable(
+                        selected = active,
+                        role = Role.RadioButton,
+                        onClick = { onSelect(i) }
+                    )
+                    .semantics { contentDescription = "$label: $opt" },
+                contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = opt,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    color = if (active) skin.chassis else skin.dim
-                )
+                Box(
+                    modifier = Modifier
+                        .border(1.dp, if (active) skin.accent else skin.dim)
+                        .background(
+                            if (active) skin.accent
+                            else androidx.compose.ui.graphics.Color.Transparent
+                        )
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = opt,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        color = if (active) skin.chassis else skin.dim
+                    )
+                }
             }
             Spacer(modifier = Modifier.width(6.dp))
         }

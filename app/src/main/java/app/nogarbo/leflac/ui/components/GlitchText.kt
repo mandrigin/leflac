@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.takeOrElse
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -64,6 +65,8 @@ fun GlitchText(
     spectrum: app.nogarbo.leflac.service.SpectrumState = app.nogarbo.leflac.service.SpectrumState(),
     idle: Boolean = false, // when the unit rests, the type rests too
     straining: Boolean = false, // decoding in progress: interference rises
+    maxLines: Int = Int.MAX_VALUE,
+    overflow: TextOverflow = TextOverflow.Clip,
     isGlitched: Boolean = false // Deprecated/Unused parameter, kept for signature compat if needed, but we will remove it from logic
 ) {
     // Matrix Text Logic - Internal State
@@ -262,6 +265,8 @@ fun GlitchText(
                 color = shiftColorA,
                 letterSpacing = dramaticTracking.sp // Apply Kerning
             ),
+            maxLines = maxLines,
+            overflow = overflow,
             modifier = Modifier
                 .offset(x = (-chromaticSep).dp + trebleJitter.dp, y = (animatedBass + magnetSmear).dp)
                 .graphicsLayer {
@@ -277,6 +282,8 @@ fun GlitchText(
                 color = shiftColorB,
                 letterSpacing = dramaticTracking.sp // Apply Kerning
             ),
+            maxLines = maxLines,
+            overflow = overflow,
             modifier = Modifier
                 .offset(x = chromaticSep.dp - trebleJitter.dp, y = (-animatedBass * 0.5f - magnetSmear).dp)
                 .graphicsLayer { alpha = (0.6f + spectrum.mid + 0.3f * magnetPulse).coerceIn(0f, 1f) }
@@ -297,6 +304,8 @@ fun GlitchText(
                 color = mainColor.copy(alpha = mainAlpha), // Apply Dramatic Alpha
                 letterSpacing = dramaticTracking.sp // Apply Kerning
             ),
+            maxLines = maxLines,
+            overflow = overflow,
             modifier = Modifier.offset(x = mainShakeX.dp, y = mainShakeY.dp)
         )
     }

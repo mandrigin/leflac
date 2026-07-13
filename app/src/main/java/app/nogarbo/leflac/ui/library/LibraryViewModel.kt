@@ -25,6 +25,9 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     // Combined list for Playback Service (so it finds mixes too)
     private val _allTracks = MutableStateFlow<List<AudioTrack>>(emptyList())
     val allTracks = _allTracks.asStateFlow()
+
+    private val _scanComplete = MutableStateFlow(false)
+    val scanComplete = _scanComplete.asStateFlow()
     
     // "Folder" mode vs "Track" mode
     private val _currentFolder = MutableStateFlow<String?>(null)
@@ -44,31 +47,39 @@ class LibraryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun scanLibrary() {
+        _scanComplete.value = false
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                val snapshot = LocalAudioLibrary(getApplication()).load()
-                val allTracks = snapshot.allTracks
-                val mixTracks = snapshot.mixes
-                val standardTracks = snapshot.songs
-                val albumFolders = snapshot.folders
-                
-                // Update state
-                // Update state
-                _mixes.value = mixTracks
-                _folders.value = albumFolders
-                _tracks.value = standardTracks // Only standard tracks shown in folders now
-                _allTracks.value = allTracks
-                
-                // Reconcile play stats with the fresh library (legacy
-                // migration + re-keying after MediaStore rescans), then
-                // surface the current hot tracks.
-                app.nogarbo.leflac.data.PlayStatsStore.reconcile(getApplication(), allTracks)
-                _hotTrackIds.value = app.nogarbo.leflac.data.PlayStatsStore.hotTrackIds(getApplication(), standardTracks)
+            try {
+                withContext(Dispatchers.IO) {
+                    val snapshot = LocalAudioLibrary(getApplication()).load()
+                    val allTracks = snapshot.allTracks
+                    val mixTracks = snapshot.mixes
+                    val standardTracks = snapshot.songs
+                    val albumFolders = snapshot.folders
 
-                // Queue Background Analysis — songs only. Mixes are analyzed
-                // lazily on play, decimated (no epic detection, basic spectral).
-                val repo = app.nogarbo.leflac.data.repository.AnalysisRepository.getInstance(getApplication())
-                repo.queueBackground(standardTracks.map { it.uri })
+                    _mixes.value = mixTracks
+                    _folders.value = albumFolders
+                    _tracks.value = standardTracks // Only standard tracks shown in folders now
+                    _allTracks.value = allTracks
+
+                    // Reconcile play stats with the fresh library (legacy
+                    // migration + re-keying after MediaStore rescans), then
+                    // surface the current hot tracks.
+                    app.nogarbo.leflac.data.PlayStatsStore.reconcile(getApplication(), allTracks)
+                    _hotTrackIds.value = app.nogarbo.leflac.data.PlayStatsStore.hotTrackIds(
+                        getApplication(),
+                        standardTracks
+                    )
+
+                    // Queue Background Analysis — songs only. Mixes are analyzed
+                    // lazily on play, decimated (no epic detection, basic spectral).
+                    val repo = app.nogarbo.leflac.data.repository.AnalysisRepository.getInstance(
+                        getApplication()
+                    )
+                    repo.queueBackground(standardTracks.map { it.uri })
+                }
+            } finally {
+                _scanComplete.value = true
             }
         }
     }

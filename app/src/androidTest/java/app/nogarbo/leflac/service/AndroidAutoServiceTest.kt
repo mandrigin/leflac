@@ -26,6 +26,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -57,6 +58,47 @@ class AndroidAutoServiceTest {
                 assertTrue(childrenResult.value?.isNotEmpty() == true)
             } finally {
                 browser.release()
+            }
+        }
+    }
+
+    @Test
+    fun media3BrowserReachesAPlayableLocalLeaf() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val snapshot = withContext(Dispatchers.IO) {
+            app.nogarbo.leflac.data.LocalAudioLibrary(context).load()
+        }
+        assumeTrue("Music and audio permission must be granted", snapshot.hasPermission)
+        assumeTrue("The device must contain at least one local track", snapshot.allTracks.isNotEmpty())
+
+        withTimeout(10_000L) {
+            withContext(Dispatchers.Main) {
+                val token = SessionToken(context, ComponentName(context, AudioService::class.java))
+                val browser = MediaBrowser.Builder(context, token).buildAsync().await()
+                try {
+                    val pending = ArrayDeque<Pair<String, Int>>()
+                    val visited = mutableSetOf<String>()
+                    pending += AndroidAutoLibrary.ROOT_ID to 0
+                    var playable: MediaItem? = null
+
+                    while (pending.isNotEmpty() && playable == null) {
+                        val (parentId, depth) = pending.removeFirst()
+                        if (!visited.add(parentId) || depth > 3) continue
+                        val result = browser.getChildren(parentId, 0, 1_000, null).await()
+                        assertEquals(LibraryResult.RESULT_SUCCESS, result.resultCode)
+                        val children = result.value.orEmpty()
+                        playable = children.firstOrNull {
+                            it.mediaMetadata.isPlayable == true
+                        }
+                        children.asSequence()
+                            .filter { it.mediaMetadata.isBrowsable == true }
+                            .forEach { pending += it.mediaId to (depth + 1) }
+                    }
+
+                    assertNotNull("Android Auto browse tree did not expose a playable track", playable)
+                } finally {
+                    browser.release()
+                }
             }
         }
     }

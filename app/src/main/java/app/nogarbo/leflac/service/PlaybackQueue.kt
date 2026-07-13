@@ -30,6 +30,16 @@ enum class ScheduleUpNextResult {
     UNAVAILABLE
 }
 
+/** Result plus the number of tracks that actually changed the physical queue. */
+data class ScheduleUpNextOutcome(
+    val result: ScheduleUpNextResult,
+    val changedCount: Int = 0
+) {
+    val shouldClearSelection: Boolean
+        get() = result != ScheduleUpNextResult.WRONG_POOL &&
+            result != ScheduleUpNextResult.UNAVAILABLE
+}
+
 fun AudioTrack.queuePool(): QueuePool =
     if (duration >= LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS) {
         QueuePool.MIX

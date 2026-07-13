@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0 — 2026-07-13 — UX consistency pass
+
+- Rechecked Music and audio permission on every Activity resume so returning
+  from system Settings immediately restores the phone ledger and refreshes the
+  Android Auto library.
+- Made Back unwind the visible interaction first: rear manual, Up Next
+  selection, search, then album, before leaving the app.
+- Preserved ordered Up Next selection and shelf scroll positions across
+  rotation/navigation; reconciled selected IDs after MediaStore rescans.
+- Added explicit feedback for current, already queued, and wrong-pool track
+  holds instead of silently ignoring the gesture or falling through to play.
+- Corrected actual-added queue feedback, startup mix classification, empty-deck
+  status, scrubber bounds/disabled state, long-title bounds, and symmetric
+  previous/next punch-in feedback.
+- Re-registered the album header, track badges/times, two-line service readout,
+  scrubber artwork, disabled PLAY face, and strip clock to the chassis grid
+  after phone screenshot review.
+- Standardized control roles, action labels, state descriptions, radio/toggle
+  semantics, and practical hit targets without changing the LF-1 faceplate.
+- Renamed `CAR SKIN` to `AA ART` and printed the sideload/host rules on the rear
+  manual: Android Auto owns its chrome; direct installs require Android Auto
+  developer mode, Unknown sources, launcher enablement, and a reconnect.
+
 ## 1.2.0 — 2026-07-12 — Up Next priority bus
 
 - Added a long-press track loader with ordered multi-selection and an explicit

@@ -21,6 +21,7 @@ import android.graphics.Typeface
 import java.io.ByteArrayOutputStream
 import app.nogarbo.leflac.R
 import app.nogarbo.leflac.service.QueuePool
+import app.nogarbo.leflac.service.ScheduleUpNextOutcome
 import app.nogarbo.leflac.service.ScheduleUpNextResult
 import app.nogarbo.leflac.service.UpNextQueue
 import app.nogarbo.leflac.service.insertPriorityAfterCurrent
@@ -565,17 +566,20 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     fun scheduleUpNext(
         requestedTracks: List<app.nogarbo.leflac.data.AudioTrack>,
         libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>
-    ): ScheduleUpNextResult {
-        val controller = mediaController ?: return ScheduleUpNextResult.UNAVAILABLE
+    ): ScheduleUpNextOutcome {
+        val controller = mediaController
+            ?: return ScheduleUpNextOutcome(ScheduleUpNextResult.UNAVAILABLE)
         if (!controller.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)) {
-            return ScheduleUpNextResult.UNAVAILABLE
+            return ScheduleUpNextOutcome(ScheduleUpNextResult.UNAVAILABLE)
         }
 
         val requested = requestedTracks.distinctBy { it.uri.toString() }
-        if (requested.isEmpty()) return ScheduleUpNextResult.ALREADY_QUEUED
+        if (requested.isEmpty()) {
+            return ScheduleUpNextOutcome(ScheduleUpNextResult.ALREADY_QUEUED)
+        }
         val requestedPool = requested.first().queuePool()
         if (requested.any { it.queuePool() != requestedPool }) {
-            return ScheduleUpNextResult.WRONG_POOL
+            return ScheduleUpNextOutcome(ScheduleUpNextResult.WRONG_POOL)
         }
 
         val current = controller.currentMediaItem
@@ -586,7 +590,10 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             }
             controller.setMediaItems(prepared, 0, 0L)
             controller.prepare()
-            return ScheduleUpNextResult.ARMED
+            return ScheduleUpNextOutcome(
+                ScheduleUpNextResult.ARMED,
+                changedCount = prepared.size
+            )
         }
 
         val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == current.mediaId }
@@ -594,7 +601,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             .takeIf { it > 0L }
             ?.let { if (it >= MIX_DURATION_THRESHOLD_MS) QueuePool.MIX else QueuePool.SONG }
         if (currentPool != null && currentPool != requestedPool) {
-            return ScheduleUpNextResult.WRONG_POOL
+            return ScheduleUpNextOutcome(ScheduleUpNextResult.WRONG_POOL)
         }
 
         val timelineItems = (0 until controller.mediaItemCount).map(controller::getMediaItemAt)
@@ -604,7 +611,9 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             marked = timelineItems.map(UpNextQueue::isMarked),
             requestedIds = requested.map { it.uri.toString() }
         )
-        if (plan.items.isEmpty()) return ScheduleUpNextResult.ALREADY_QUEUED
+        if (plan.items.isEmpty()) {
+            return ScheduleUpNextOutcome(ScheduleUpNextResult.ALREADY_QUEUED)
+        }
 
         val requestedById = requested.associateBy { it.uri.toString() }
         val markedItems = plan.items.map { planned ->
@@ -617,7 +626,10 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         }
 
         controller.addMediaItems(plan.insertionIndex, markedItems)
-        return ScheduleUpNextResult.ADDED
+        return ScheduleUpNextOutcome(
+            ScheduleUpNextResult.ADDED,
+            changedCount = markedItems.size
+        )
     }
 
     fun removeFromUpNext(entryId: String) {

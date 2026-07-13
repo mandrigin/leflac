@@ -89,4 +89,23 @@ class PlaybackQueueTest {
             )
         )
     }
+
+    @Test
+    fun queueOutcomeOnlyRetainsSelectionForRetryableFailures() {
+        assertEquals(
+            true,
+            ScheduleUpNextOutcome(ScheduleUpNextResult.ADDED, changedCount = 2)
+                .shouldClearSelection
+        )
+        assertEquals(
+            false,
+            ScheduleUpNextOutcome(ScheduleUpNextResult.WRONG_POOL)
+                .shouldClearSelection
+        )
+        assertEquals(
+            false,
+            ScheduleUpNextOutcome(ScheduleUpNextResult.UNAVAILABLE)
+                .shouldClearSelection
+        )
+    }
 }

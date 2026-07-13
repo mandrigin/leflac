@@ -18,6 +18,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import app.nogarbo.leflac.ui.theme.GridLines
 import app.nogarbo.leflac.ui.theme.SafetyOrange
@@ -41,10 +44,18 @@ fun FieldScrubber(
     var isDragging by remember { mutableStateOf(false) }
     var dragProgress by remember { mutableFloatStateOf(0f) }
 
-    val progress = if (duration > 0) {
-        if (isDragging) dragProgress else position.toFloat() / duration.toFloat()
+    val progress = if (duration > 0L) {
+        (if (isDragging) dragProgress else position.toFloat() / duration.toFloat())
+            .coerceIn(0f, 1f)
     } else {
         0f
+    }
+    LaunchedEffect(duration) {
+        lastDetent = -1L
+        if (duration <= 0L) {
+            isDragging = false
+            dragProgress = 0f
+        }
     }
 
     // Use a Box to stack the custom drawing and the invisible touch target
@@ -52,13 +63,21 @@ fun FieldScrubber(
         modifier = modifier
             .fillMaxWidth()
             .height(64.dp) // Touch target height
-            .graphicsLayer(rotationZ = -2f) // Slight technical tilt
     ) {
         // 1. VISUAL LAYER (Passive)
         val railColor = if (skin.isLcd) skin.shadeLight
             else androidx.compose.material3.MaterialTheme.colorScheme.onBackground.copy(alpha = 0.3f)
         val thumbColor = androidx.compose.material3.MaterialTheme.colorScheme.onBackground
-        Canvas(modifier = Modifier.fillMaxWidth().height(24.dp).padding(vertical = 8.dp).align(androidx.compose.ui.Alignment.Center)) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(24.dp)
+                .padding(vertical = 8.dp)
+                .align(androidx.compose.ui.Alignment.Center)
+                // Only the printed rail is canted. The clock and the touch
+                // coordinate system stay registered to the chassis grid.
+                .graphicsLayer(rotationZ = -2f)
+        ) {
             val width = size.width
             val height = size.height
             val barHeight = 4.dp.toPx()
@@ -143,7 +162,7 @@ fun FieldScrubber(
             }
             
             // 2. Progress Fill
-            val drawProgress = if (isDragging) dragProgress else progress
+            val drawProgress = (if (isDragging) dragProgress else progress).coerceIn(0f, 1f)
             val progressWidth = width * drawProgress
             drawRect(
                 color = skin.accent,
@@ -152,8 +171,11 @@ fun FieldScrubber(
             )
             
             // 3. Thumb / Reticle
-            val thumbX = progressWidth
             val thumbSize = 12.dp.toPx()
+            val offset = thumbSize * 0.4f // 3D depth
+            val minThumbX = thumbSize / 2f
+            val maxThumbX = (width - thumbSize / 2f - offset).coerceAtLeast(minThumbX)
+            val thumbX = progressWidth.coerceIn(minThumbX, maxThumbX)
             val thumbY = centerY - thumbSize / 2
             
 
@@ -161,8 +183,6 @@ fun FieldScrubber(
             val baseCyan = skin.cubeFront
             val topCyan = skin.cubeTop
             val sideCyan = skin.cubeSide
-            
-            val offset = thumbSize * 0.4f // 3D depth
             
             val path = androidx.compose.ui.graphics.Path()
             
@@ -194,7 +214,7 @@ fun FieldScrubber(
             // 3.5 Cue Points (mix track boundaries): tall ticks above the rail
             if (duration > 0 && cuePoints.isNotEmpty()) {
                 for (cue in cuePoints) {
-                    val cx = width * (cue.toFloat() / duration)
+                    val cx = width * (cue.toFloat() / duration).coerceIn(0f, 1f)
                     drawLine(
                         color = skin.accent.copy(alpha = if (skin.isLcd) 1f else 0.7f),
                         start = Offset(cx, centerY - barHeight * 2.5f),
@@ -221,9 +241,13 @@ fun FieldScrubber(
         // Shows current drag time or playback time
         val displayTimeMillis = if (duration > 0) {
            if (isDragging) (dragProgress * duration).toLong() else position
-        } else 0L
+        } else {
+            0L
+        }.coerceIn(0L, duration.coerceAtLeast(0L))
         
         val (timeString, microString) = app.nogarbo.leflac.util.TimeFormatter.formatCasioTime(displayTimeMillis)
+        val totalTimeString = app.nogarbo.leflac.util.TimeFormatter
+            .formatCasioTime(duration.coerceAtLeast(0L)).first
         
         // Position: Top Right of the scrubber box? Or Centered above?
         // Let's put it TopEnd to mimic a device readout.
@@ -260,7 +284,8 @@ fun FieldScrubber(
         // 2. INTERACTION LAYER (Active Invisible Slider)
         // We map the slider 0f..1f to the duration
         androidx.compose.material3.Slider(
-            value = if (isDragging) dragProgress else progress,
+            value = (if (isDragging) dragProgress else progress).coerceIn(0f, 1f),
+            enabled = duration > 0L,
             onValueChange = { 
                 isDragging = true
                 dragProgress = it
@@ -282,6 +307,7 @@ fun FieldScrubber(
                 }
             },
             thumb = {}, // Hides the thumb completely
+            track = {}, // The custom Canvas is the only visible rail.
             colors = androidx.compose.material3.SliderDefaults.colors(
                 thumbColor = Color.Transparent,
                 activeTrackColor = Color.Transparent,
@@ -289,7 +315,17 @@ fun FieldScrubber(
                 activeTickColor = Color.Transparent,
                 inactiveTickColor = Color.Transparent
             ),
-            modifier = Modifier.fillMaxWidth().align(androidx.compose.ui.Alignment.Center)
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(androidx.compose.ui.Alignment.Center)
+                .semantics {
+                    contentDescription = "Playback position"
+                    stateDescription = if (duration > 0L) {
+                        "$timeString of $totalTimeString"
+                    } else {
+                        "No track loaded"
+                    }
+                }
         )
     }
 }

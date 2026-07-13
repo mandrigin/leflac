@@ -27,6 +27,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import app.nogarbo.leflac.ui.theme.ChassisBeige
@@ -38,6 +39,9 @@ fun IsometricButton(
     text: String,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null,
+    onClickLabel: String = text,
+    onLongClickLabel: String? = null,
+    enabled: Boolean = true,
     modifier: Modifier = Modifier,
     size: Dp = 64.dp,
     baseColor: Color = SafetyOrange,
@@ -46,7 +50,8 @@ fun IsometricButton(
     isOutline: Boolean = false,
     textStyle: androidx.compose.ui.text.TextStyle = androidx.compose.material3.MaterialTheme.typography.headlineMedium,
     globalPunchIn: Float = 0f,
-    isPunchInSource: Boolean = false
+    isPunchInSource: Boolean = false,
+    isPunchInCapable: Boolean = isPunchInSource
 ) {
     val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
     val hapticView = androidx.compose.ui.platform.LocalView.current
@@ -74,9 +79,12 @@ fun IsometricButton(
     val shakeY = baseShakeY + if (globalPunchIn > 0f && !isPunchInSource) (kotlin.random.Random.nextFloat() * 6f - 3f) * globalPunchIn else 0f
 
     // T.E. Strobe colors for non-source buttons during punch-in
-    val isGlobalStrobing = globalPunchIn > 0f && !isPunchInSource && (globalPunchIn * 30).toInt() % 2 == 0
-    val effectiveBaseColor = if (isGlobalStrobing) contentColor else baseColor
-    val effectiveContentColor = if (isGlobalStrobing) baseColor else contentColor
+    val visualBaseColor = if (enabled) baseColor else skin.buttonBase
+    val visualContentColor = if (enabled) contentColor else skin.dim
+    val isGlobalStrobing = enabled && globalPunchIn > 0f && !isPunchInSource &&
+        (globalPunchIn * 30).toInt() % 2 == 0
+    val effectiveBaseColor = if (isGlobalStrobing) visualContentColor else visualBaseColor
+    val effectiveContentColor = if (isGlobalStrobing) visualBaseColor else visualContentColor
     val effectiveIsOutline = if (globalPunchIn > 0f && !isPunchInSource) !isOutline else isOutline
 
     val animatedBgColor by androidx.compose.animation.animateColorAsState(
@@ -106,7 +114,7 @@ fun IsometricButton(
 
     // Military Target Locking Progress
     val lockProgress by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isPressed && isPunchInSource) 1f else 0f,
+        targetValue = if (isPressed && isPunchInCapable) 1f else 0f,
         animationSpec = androidx.compose.animation.core.tween(durationMillis = 500, easing = androidx.compose.animation.core.LinearEasing)
     )
 
@@ -192,8 +200,12 @@ fun IsometricButton(
                 .background(animatedBgColor)
                 .border(1.dp, animatedBorderColor)
                 .combinedClickable(
+                    enabled = enabled,
                     interactionSource = interactionSource,
                     indication = null, // Handle visual state manually
+                    role = Role.Button,
+                    onClickLabel = onClickLabel,
+                    onLongClickLabel = onLongClickLabel,
                     onClick = {
                         hapticView.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
                         app.nogarbo.leflac.util.MachineVoice.click()

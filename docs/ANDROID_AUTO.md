@@ -1,6 +1,6 @@
 # LE FLAC Android Auto Operator Guide
 
-This guide covers LF-1 1.2.0 on projected Android Auto, with the first live
+This guide covers LF-1 1.3.0 on projected Android Auto, with the first live
 acceptance run targeted at a Honda e. LE FLAC remains offline-only: the car
 browser reads the phone's MediaStore and the app still declares no `INTERNET`
 permission.
@@ -34,7 +34,7 @@ would reorder the shared timeline around explicit UP NEXT items.
 
 Android Auto and the Honda head unit render the driving-safe chrome, typography,
 and templates. A media app cannot place the phone's Compose faceplate on the
-dashboard. The `CAR SKIN` switch controls the app-owned surfaces that the host
+dashboard. The `AA ART` switch controls the app-owned surfaces that the host
 allows: browse artwork, now-playing artwork, metadata, and grid/list hints.
 
 - `POCKET` is the default: aged four-tone LCD glass and dark pixel ink.
@@ -45,7 +45,7 @@ allows: browse artwork, now-playing artwork, metadata, and grid/list hints.
   library or playback behavior.
 
 To change it, open LE FLAC on the phone, tap the `LF-1` nameplate to flip to the
-rear panel, then select `CAR SKIN [POCKET] [FIELD]`. The active media session and
+rear panel, then select `AA ART [POCKET] [FIELD]`. The active media session and
 subscribed car browsers are refreshed immediately.
 
 See Android's official notes on [content styles](https://developer.android.com/training/cars/media/create-media-browser/content-styles)
@@ -57,7 +57,7 @@ The checked-in build uses:
 
 | Component | Version |
 |---|---:|
-| App | 1.2.0 (version code 3) |
+| App | 1.3.0 (version code 4) |
 | Media3 | 1.10.1 |
 | compile SDK | 36 |
 | target SDK | 34 |
@@ -101,7 +101,13 @@ Do this while parked:
 4. In the Android Auto phone settings, enable developer mode and **Unknown
    sources** for a directly sideloaded build. A Play internal-test install does
    not need this sideload exception.
-5. Leave battery optimization at its normal setting initially; Media3 owns the
+5. Under Android Auto **Customize launcher**, enable **LE FLAC**, then fully
+   disconnect and reconnect the projection session so the host refreshes its
+   eligible media sources.
+6. Open LE FLAC from the Android Auto app drawer/media-source picker. The
+   generic active-media card is only the shared MediaSession surface; tapping
+   its phone Activity shortcut can correctly produce a parked-only prompt.
+7. Leave battery optimization at its normal setting initially; Media3 owns the
    foreground media session while playback is active.
 
 Android documents the sideload and test path in [Test Android apps for cars](https://developer.android.com/training/cars/testing).
@@ -117,7 +123,7 @@ Android Auto.
    charge-only cable.
 3. Connect to the Honda e's Android Auto-capable front USB port.
 4. Accept the phone and Honda CONNECT first-run prompts.
-5. Open the Android Auto app launcher and select **Le FLAC**.
+5. Open the Android Auto app launcher and select **LE FLAC**.
 6. Confirm the root opens without first bringing the phone Activity to the
    foreground.
 7. Confirm the default artwork is POCKET.
@@ -130,7 +136,7 @@ Android Auto.
     normal rail resumes.
 11. Switch ORDER/RNG on the phone and confirm the two explicit entries remain
     ahead of the rebuilt rail.
-12. On the parked phone, move `CAR SKIN` to FIELD and return to the car UI;
+12. On the parked phone, move `AA ART` to FIELD and return to the car UI;
     confirm app-owned art refreshes. Put it back to the preferred setting.
 
 Honda publishes owner manuals from its [official manuals and guides page](https://www.honda.co.uk/cars/owners/manuals-and-guides/honda-owners-manuals.html).
@@ -143,13 +149,13 @@ until this live matrix is completed.
 
 Run every item while parked unless it explicitly tests an interruption:
 
-- **Discovery:** Le FLAC appears once, not once per controller/session.
+- **Discovery:** LE FLAC appears once, not once per controller/session.
 - **Cold start:** force-stop the phone app, then open it from Android Auto.
 - **Permission denied:** after a clean-data test, the car shows the parked-safe
   phone setup instruction instead of crashing or showing an endless spinner.
 - **Library:** root content loads promptly; no empty Hot now dead end; folders,
   mixes, and track metadata are correct.
-- **Voice:** “Play _track_ on Le FLAC” and a broad “Play music on Le FLAC” both
+- **Voice:** “Play _track_ on LE FLAC” and a broad “Play music on LE FLAC” both
   resolve locally.
 - **Transport:** play/pause/seek/next/previous and steering-wheel controls track
   the phone UI.

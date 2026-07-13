@@ -26,7 +26,7 @@ class AndroidAutoLibrary(private val context: Context) {
     fun rootItem(scheme: AndroidAutoVisualScheme): MediaItem = browsableItem(
         id = ROOT_ID,
         title = "LE FLAC",
-        subtitle = "${scheme.name} car deck",
+        subtitle = "Local library · ${scheme.name} art",
         mediaType = MediaMetadata.MEDIA_TYPE_FOLDER_MIXED,
         scheme = scheme,
         childBrowsableStyle = MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM,

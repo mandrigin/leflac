@@ -9,7 +9,7 @@ LE FLAC is a local-only music player that behaves like a piece of field
 equipment: it analyses every track it touches, knows where the drops are
 before they arrive, keeps a clock on its sleep screen, prints its manual
 and its own circuit diagram on the back of the chassis, and runs a 25×25
-LED cassette deck on the Glyph Matrix. LF-1 1.2 is also a projected, browsable
+LED cassette deck on the Glyph Matrix. LF-1 1.3 is also a projected, browsable
 Android Auto media source and adds a persistent, explicit UP NEXT bus without
 adding a network permission.
 
@@ -173,9 +173,9 @@ real call path.
    └─────────┘  └────────┘  └──────────┘
 ```
 
-DIP switches for phone skin override, Android Auto car skin, and machine
-voice. The car defaults independently to POCKET so phone brightness can
-never change the dashboard personality. A serial number is minted on first
+DIP switches for phone skin override, Android Auto artwork, and machine
+voice. Car artwork defaults independently to POCKET so phone brightness can
+never change it. A serial number is minted on first
 run. Your lifetime listening hours are etched. First launch opens on the
 back, because unboxing means reading the manual.
 
@@ -202,8 +202,8 @@ transitions and steering-wheel NEXT consume them before returning to ORDER/RNG.
 Hosts decide whether to expose their standard queue page; no extra car browse
 destination is required.
 
-The head unit owns its typography, chrome, and final layout. `CAR SKIN` on
-the rear panel therefore controls the parts LE FLAC is allowed to own:
+The head unit owns its typography, chrome, transport buttons, and final layout.
+`AA ART` on the rear panel therefore controls the parts LE FLAC is allowed to own:
 browse/now-playing artwork and content-style hints. It defaults to **POCKET**;
 **FIELD** uses the beige/orange/cyan instrument palette. Hosts may override
 layout hints, but playback and browsing do not depend on them. Because Android
@@ -214,7 +214,9 @@ faceplate itself remains on its independent `SKIN` setting.
 For the first Honda e test, install and open LE FLAC once, grant **Music and
 audio**, then connect while parked using the Android Auto data USB port and
 a certified data cable. Sideloaded builds require Android Auto developer mode
-and **Unknown sources**. The complete live-car checklist and DHU commands are
+and **Unknown sources**; also enable **LE FLAC** under Customize launcher, then
+disconnect and reconnect. Open LE FLAC from the app drawer/media-source picker,
+not from the generic active-media card. The complete live-car checklist is
 in [`docs/ANDROID_AUTO.md`](docs/ANDROID_AUTO.md).
 
 ## OPERATING
@@ -230,13 +232,15 @@ make build                  # assemble the APK
 scripts/push_music.sh DIR   # push a folder of music to the device
 ```
 
-The exact phone-tested sideload build is attached to the
-[v1.2.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.2.0).
+The final v1.3 sideload build is attached to the
+[v1.3.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.3.0).
+Its immediately preceding candidate was phone-tested; the release notes record
+the final compact service-control spacing delta that awaits the next install.
 That APK uses the development/debug signing key and is intended for direct
 testing, not store distribution. Upgrade preservation requires the installed
-copy to use the same signing key. Version 1.2.0 uses Media3 1.10.1 and API 36
-build tooling while retaining target SDK 34 for the initial sideloaded Honda e
-validation. It needs a local
+copy to use the same signing key. Version 1.3.0 uses Media3 1.10.1 and API 36
+build tooling while retaining target SDK 34 for sideloaded Android Auto
+compatibility. It needs a local
 music library (it scans MediaStore) and, for the full experience, a
 Nothing Phone (3) with the Glyph Matrix. Add LE FLAC as a Glyph Toy in
 settings; transport and track-loader long presses are deliberate, by design. The

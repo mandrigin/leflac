@@ -6,6 +6,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -14,9 +16,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.snapshots.SnapshotStateList
+import androidx.compose.runtime.toMutableStateList
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
@@ -50,6 +56,7 @@ fun LibraryGrid(
     upNext: List<UpNextEntry> = emptyList(),
     onGymStart: () -> Unit = {},
     onTracksQueued: (List<AudioTrack>) -> Boolean = { false },
+    onQueueBlocked: (String) -> Unit = {},
     onUpNextRemoved: (String) -> Unit = {},
     onUpNextCleared: () -> Unit = {},
     onTrackSelected: (AudioTrack) -> Unit
@@ -59,7 +66,17 @@ fun LibraryGrid(
     val mixes by viewModel.mixes.collectAsState()
     val folders by viewModel.folders.collectAsState()
     val tracks by viewModel.tracks.collectAsState()
-    val selectedForQueue = remember { mutableStateListOf<AudioTrack>() }
+    val scanComplete by viewModel.scanComplete.collectAsState()
+    val libraryById = remember(tracks, mixes) {
+        (tracks + mixes).associateBy { it.uri.toString() }
+    }
+    val selectedQueueIds: SnapshotStateList<String> = rememberSaveable(
+        saver = listSaver(
+            save = { it.toList() },
+            restore = { it.toMutableStateList() }
+        )
+    ) { mutableStateListOf() }
+    val selectedForQueue = selectedQueueIds.mapNotNull(libraryById::get)
     val selectionActive = selectedForQueue.isNotEmpty()
     val queuedPositions = remember(upNext) {
         upNext.mapIndexed { index, entry -> entry.mediaId to (index + 1) }
@@ -76,28 +93,60 @@ fun LibraryGrid(
         }
     }
 
-    fun isQueueCandidate(track: AudioTrack): Boolean {
+    fun poolLabel(pool: app.nogarbo.leflac.service.QueuePool): String =
+        if (pool == app.nogarbo.leflac.service.QueuePool.MIX) "MIXES" else "SONGS"
+
+    fun baseQueueBlockReason(track: AudioTrack): String? {
         val mediaId = track.uri.toString()
-        return mediaId != playingTrackId &&
-            mediaId !in queuedPositions &&
-            (playingPool == null || track.queuePool() == playingPool)
-    }
-
-    fun isSelectionCompatible(track: AudioTrack): Boolean =
-        selectedForQueue.firstOrNull()?.queuePool()?.let { it == track.queuePool() } ?: true
-
-    fun toggleQueueSelection(track: AudioTrack) {
-        val selectedIndex = selectedForQueue.indexOfFirst { it.uri == track.uri }
-        if (selectedIndex >= 0) {
-            selectedForQueue.removeAt(selectedIndex)
-        } else if (isSelectionCompatible(track) && isQueueCandidate(track)) {
-            selectedForQueue += track
+        return when {
+            mediaId == playingTrackId -> "CURRENT TRACK · ALREADY PLAYING"
+            mediaId in queuedPositions -> "ALREADY UP NEXT"
+            playingPool != null && track.queuePool() != playingPool ->
+                "UP NEXT LOCKED TO ${poolLabel(playingPool)}"
+            else -> null
         }
     }
 
-    BackHandler(enabled = selectionActive) { selectedForQueue.clear() }
-    androidx.compose.runtime.LaunchedEffect(playingTrackId, upNext) {
-        selectedForQueue.removeAll { !isQueueCandidate(it) }
+    fun queueBlockReason(track: AudioTrack): String? {
+        baseQueueBlockReason(track)?.let { return it }
+        val selectedPool = selectedForQueue.firstOrNull()?.queuePool()
+        return if (selectedPool != null && track.queuePool() != selectedPool) {
+            "SELECTION LOCKED TO ${poolLabel(selectedPool)}"
+        } else {
+            null
+        }
+    }
+
+    fun toggleQueueSelection(track: AudioTrack) {
+        val mediaId = track.uri.toString()
+        val selectedIndex = selectedQueueIds.indexOf(mediaId)
+        if (selectedIndex >= 0) {
+            selectedQueueIds.removeAt(selectedIndex)
+        } else {
+            val reason = queueBlockReason(track)
+            if (reason == null) selectedQueueIds += mediaId else onQueueBlocked(reason)
+        }
+    }
+
+    androidx.compose.runtime.LaunchedEffect(
+        scanComplete,
+        playingTrackId,
+        upNext,
+        tracks,
+        mixes
+    ) {
+        if (!scanComplete) return@LaunchedEffect
+        val reconciled = reconcileQueueSelectionIds(
+            selectedIds = selectedQueueIds,
+            availablePools = libraryById.mapValues { (_, track) -> track.queuePool() },
+            blockedIds = libraryById.values
+                .filter { baseQueueBlockReason(it) != null }
+                .mapTo(mutableSetOf()) { it.uri.toString() }
+        )
+        if (reconciled != selectedQueueIds) {
+            selectedQueueIds.clear()
+            selectedQueueIds.addAll(reconciled)
+        }
     }
 
     // Albums holding at least one hot track get the flame on their tile
@@ -159,6 +208,29 @@ fun LibraryGrid(
         }
     }
     val currentFolder by viewModel.currentFolder.collectAsState()
+    val focusManager = LocalFocusManager.current
+    val searchListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val hotListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val mixesListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val albumsListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val upNextListState = androidx.compose.foundation.lazy.rememberLazyListState()
+    androidx.compose.runtime.LaunchedEffect(searchQuery) {
+        if (searchQuery.isNotBlank()) searchListState.scrollToItem(0)
+    }
+
+    BackHandler(
+        enabled = selectionActive || searchQuery.isNotBlank() || currentFolder != null
+    ) {
+        when (libraryBackAction(selectionActive, searchQuery.isNotBlank(), currentFolder != null)) {
+            LibraryBackAction.CANCEL_SELECTION -> selectedQueueIds.clear()
+            LibraryBackAction.CLEAR_SEARCH -> {
+                searchQuery = ""
+                focusManager.clearFocus()
+            }
+            LibraryBackAction.EXIT_ALBUM -> viewModel.exitFolder()
+            LibraryBackAction.NONE -> Unit
+        }
+    }
 
     // Determine playing folder
     val playingFolder = remember(playingTrackId, tracks) {
@@ -171,9 +243,16 @@ fun LibraryGrid(
     val isMixPlaying = remember(playingTrackId, mixes) {
         playingTrackId != null && mixes.any { it.uri.toString() == playingTrackId }
     }
-    androidx.compose.runtime.LaunchedEffect(playingTrackId) {
+    androidx.compose.runtime.LaunchedEffect(
+        playingTrackId,
+        isMixPlaying,
+        playingFolder,
+        scanComplete
+    ) {
         if (playingTrackId == null) return@LaunchedEffect
+        if (!scanComplete) return@LaunchedEffect
         if (selectionActive) return@LaunchedEffect
+        if (searchQuery.isNotBlank()) return@LaunchedEffect
         if (isMixPlaying && activeTab != TAB_UP_NEXT) {
             selectedTab = TAB_MIXES
         } else if (activeTab == TAB_ALBUMS) {
@@ -202,10 +281,10 @@ fun LibraryGrid(
                 count = selectedForQueue.size,
                 onCommit = {
                     if (onTracksQueued(selectedForQueue.toList())) {
-                        selectedForQueue.clear()
+                        selectedQueueIds.clear()
                     }
                 },
-                onCancel = selectedForQueue::clear
+                onCancel = selectedQueueIds::clear
             )
         }
         if (currentFolder != null) {
@@ -227,8 +306,15 @@ fun LibraryGrid(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
+                    // Keep the engraved seam on the 40dp chassis grid.
+                    // Foundation expands the pointer target beyond the
+                    // measured face without making the plate 8dp too tall.
                     .height(40.dp)
-                    .clickable { viewModel.exitFolder() }
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Return to albums",
+                        onClick = viewModel::exitFolder
+                    )
                     .drawBehind {
                         drawLine(
                             color = seamColor,
@@ -243,16 +329,18 @@ fun LibraryGrid(
                 Text(
                     text = "< RETURN",
                     style = FieldTypography.labelMedium,
-                    color = skin.accent
+                    color = skin.accent,
+                    maxLines = 1
                 )
-                Spacer(modifier = Modifier.weight(1f))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = "LIB // ${currentFolder?.uppercase()} · ${folderTracks.size}",
                     style = FieldTypography.labelSmall,
                     color = skin.dim,
                     maxLines = 1,
                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(start = 8.dp)
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
                 )
             }
 
@@ -271,9 +359,8 @@ fun LibraryGrid(
                         selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
                             .takeIf { it >= 0 }?.plus(1),
                         selectionMode = selectionActive,
-                        queueEligible = isQueueCandidate(track),
-                        selectionEnabled = !selectionActive ||
-                            (isSelectionCompatible(track) && isQueueCandidate(track)),
+                        queueBlockedReason = queueBlockReason(track),
+                        selectionEnabled = !selectionActive || queueBlockReason(track) == null,
                         onLongClick = { toggleQueueSelection(track) },
                         onClick = {
                             if (selectionActive) toggleQueueSelection(track)
@@ -293,6 +380,7 @@ fun LibraryGrid(
         if (searchQuery.isNotBlank()) {
             // COMMAND RESULTS replace the shelves while the prompt is live
             androidx.compose.foundation.lazy.LazyColumn(
+                state = searchListState,
                 contentPadding = PaddingValues(bottom = 24.dp)
             ) {
                 if (searchResults.isEmpty()) {
@@ -316,9 +404,8 @@ fun LibraryGrid(
                         selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
                             .takeIf { it >= 0 }?.plus(1),
                         selectionMode = selectionActive,
-                        queueEligible = isQueueCandidate(track),
-                        selectionEnabled = !selectionActive ||
-                            (isSelectionCompatible(track) && isQueueCandidate(track)),
+                        queueBlockedReason = queueBlockReason(track),
+                        selectionEnabled = !selectionActive || queueBlockReason(track) == null,
                         onLongClick = { toggleQueueSelection(track) },
                         onClick = {
                             if (selectionActive) {
@@ -343,6 +430,7 @@ fun LibraryGrid(
                 TAB_HOT -> {
                     // HOT NOW: what the unit knows you are into right now
                     androidx.compose.foundation.lazy.LazyColumn(
+                        state = hotListState,
                         contentPadding = PaddingValues(bottom = 24.dp)
                     ) {
                         if (hotTracks.isEmpty()) {
@@ -369,9 +457,8 @@ fun LibraryGrid(
                                 selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
                                     .takeIf { it >= 0 }?.plus(1),
                                 selectionMode = selectionActive,
-                                queueEligible = isQueueCandidate(track),
-                                selectionEnabled = !selectionActive ||
-                                    (isSelectionCompatible(track) && isQueueCandidate(track)),
+                                queueBlockedReason = queueBlockReason(track),
+                                selectionEnabled = !selectionActive || queueBlockReason(track) == null,
                                 onLongClick = { toggleQueueSelection(track) },
                                 onClick = {
                                     if (selectionActive) toggleQueueSelection(track)
@@ -388,8 +475,7 @@ fun LibraryGrid(
                         mixes.groupBy { it.artist.ifBlank { "UNKNOWN ARTIST" } }
                             .toSortedMap(String.CASE_INSENSITIVE_ORDER)
                     }
-                    val mixListState = androidx.compose.foundation.lazy.rememberLazyListState()
-                    androidx.compose.runtime.LaunchedEffect(playingTrackId) {
+                    androidx.compose.runtime.LaunchedEffect(playingTrackId, mixes) {
                         if (playingTrackId == null) return@LaunchedEffect
                         // Flat index of the playing mix, counting artist sub-headers
                         var row = 0
@@ -400,10 +486,10 @@ fun LibraryGrid(
                             if (i != -1 && target == -1) target = row + i
                             row += artistMixes.size
                         }
-                        if (target != -1) mixListState.animateScrollToItem(target)
+                        if (target != -1) mixesListState.animateScrollToItem(target)
                     }
                     androidx.compose.foundation.lazy.LazyColumn(
-                        state = mixListState,
+                        state = mixesListState,
                         contentPadding = PaddingValues(bottom = 24.dp)
                     ) {
                         if (mixes.isEmpty()) {
@@ -441,9 +527,8 @@ fun LibraryGrid(
                                     selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
                                         .takeIf { it >= 0 }?.plus(1),
                                     selectionMode = selectionActive,
-                                    queueEligible = isQueueCandidate(track),
-                                    selectionEnabled = !selectionActive ||
-                                        (isSelectionCompatible(track) && isQueueCandidate(track)),
+                                    queueBlockedReason = queueBlockReason(track),
+                                    selectionEnabled = !selectionActive || queueBlockReason(track) == null,
                                     onLongClick = { toggleQueueSelection(track) },
                                     onClick = {
                                         if (selectionActive) toggleQueueSelection(track)
@@ -459,6 +544,7 @@ fun LibraryGrid(
                     // ALBUMS: tile grid of folders (an open album renders
                     // above, replacing the shelves entirely)
                         androidx.compose.foundation.lazy.LazyColumn(
+                            state = albumsListState,
                             contentPadding = PaddingValues(bottom = 24.dp)
                         ) {
                             if (folders.isEmpty()) {
@@ -507,6 +593,7 @@ fun LibraryGrid(
                 }
                 else -> UpNextPanel(
                     entries = upNext,
+                    listState = upNextListState,
                     onRemove = onUpNextRemoved,
                     onClear = onUpNextCleared
                 )
@@ -536,7 +623,7 @@ private fun QueueSelectionBar(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Text(
-            text = "LOAD NEXT // ${count.toString().padStart(2, '0')}",
+            text = "UP NEXT // ${compactQueueCount(count)} SELECTED",
             style = FieldTypography.labelMedium,
             color = skin.accent,
             modifier = Modifier.padding(start = 16.dp).weight(1f)
@@ -546,7 +633,11 @@ private fun QueueSelectionBar(
                 .width(76.dp)
                 .fillMaxHeight()
                 .border(1.dp, skin.accent)
-                .clickable(onClick = onCommit)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Commit selected tracks to Up Next",
+                    onClick = onCommit
+                )
                 .semantics {
                     contentDescription =
                         "Commit $count selected ${if (count == 1) "track" else "tracks"} to Up Next"
@@ -558,7 +649,11 @@ private fun QueueSelectionBar(
         Box(
             modifier = Modifier
                 .size(48.dp)
-                .clickable(onClick = onCancel)
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = "Cancel Up Next selection",
+                    onClick = onCancel
+                )
                 .semantics { contentDescription = "Cancel Up Next selection" },
             contentAlignment = Alignment.Center
         ) {
@@ -575,7 +670,7 @@ private fun LedgerTabs(active: Int, upNextCount: Int, onSelect: (Int) -> Unit) {
         if (skin.isLcd) app.nogarbo.leflac.ui.components.rememberDitherBrush(skin.accent, 0.25f)
         else androidx.compose.ui.graphics.SolidColor(skin.accent.copy(alpha = 0.08f))
     val nextLabel = if (upNextCount > 0) {
-        "NEXT ${upNextCount.coerceAtMost(99).toString().padStart(2, '0')}"
+        "NEXT ${compactQueueCount(upNextCount)}"
     } else {
         "NEXT"
     }
@@ -586,6 +681,7 @@ private fun LedgerTabs(active: Int, upNextCount: Int, onSelect: (Int) -> Unit) {
             .fillMaxWidth()
             .height(32.dp)
             .border(1.dp, skin.dim)
+            .selectableGroup()
     ) {
         labels.forEachIndexed { index, label ->
             val isActive = index == active
@@ -594,10 +690,12 @@ private fun LedgerTabs(active: Int, upNextCount: Int, onSelect: (Int) -> Unit) {
                     .weight(1f)
                     .fillMaxHeight()
                     .then(if (isActive) Modifier.background(activeBg) else Modifier)
-                    .clickable { onSelect(index) }
+                    .selectable(
+                        selected = isActive,
+                        role = Role.Tab,
+                        onClick = { onSelect(index) }
+                    )
                     .semantics {
-                        selected = isActive
-                        role = Role.Tab
                         if (index == TAB_UP_NEXT) {
                             stateDescription =
                                 "$upNextCount ${if (upNextCount == 1) "track" else "tracks"} queued"
@@ -628,6 +726,7 @@ private fun LedgerTabs(active: Int, upNextCount: Int, onSelect: (Int) -> Unit) {
 @Composable
 private fun UpNextPanel(
     entries: List<UpNextEntry>,
+    listState: androidx.compose.foundation.lazy.LazyListState,
     onRemove: (String) -> Unit,
     onClear: () -> Unit
 ) {
@@ -649,7 +748,7 @@ private fun UpNextPanel(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "PRIORITY BUS // ${entries.size.toString().padStart(2, '0')}",
+                text = "UP NEXT // ${compactQueueCount(entries.size)}",
                 style = FieldTypography.labelMedium,
                 color = skin.accent,
                 modifier = Modifier.weight(1f)
@@ -659,7 +758,11 @@ private fun UpNextPanel(
                     modifier = Modifier
                         .width(72.dp)
                         .fillMaxHeight()
-                        .clickable(onClick = onClear)
+                        .clickable(
+                            role = Role.Button,
+                            onClickLabel = "Clear Up Next",
+                            onClick = onClear
+                        )
                         .semantics {
                             contentDescription =
                                 "Clear ${entries.size} Up Next ${if (entries.size == 1) "track" else "tracks"}"
@@ -674,7 +777,7 @@ private fun UpNextPanel(
         if (entries.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    text = "QUEUE EMPTY\n[HOLD A TRACK TO LOAD]",
+                    text = "UP NEXT EMPTY\n[HOLD A TRACK TO LOAD]",
                     style = FieldTypography.labelMedium,
                     color = skin.dim,
                     textAlign = TextAlign.Center
@@ -682,6 +785,7 @@ private fun UpNextPanel(
             }
         } else {
             androidx.compose.foundation.lazy.LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(bottom = 24.dp)
             ) {
@@ -690,45 +794,66 @@ private fun UpNextPanel(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(64.dp)
+                            .heightIn(min = 64.dp)
                             .border(1.dp, if (index == 0) skin.accent else Color.Transparent)
                             .padding(start = 16.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = (index + 1).toString().padStart(2, '0'),
-                            style = FieldTypography.labelSmall,
-                            color = skin.accent,
-                            modifier = Modifier.width(32.dp)
-                        )
-                        Column(modifier = Modifier.weight(1f)) {
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .semantics(mergeDescendants = true) {
+                                    val durationLabel = if (entry.durationMs >= 0L) {
+                                        ", ${formatDuration(entry.durationMs)}"
+                                    } else {
+                                        ""
+                                    }
+                                    contentDescription =
+                                        "Up Next ${index + 1} of ${entries.size}, " +
+                                        "${entry.title}, ${entry.artist}$durationLabel"
+                                    if (index == 0) stateDescription = "Plays next"
+                                },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             Text(
-                                text = entry.title.uppercase(),
-                                style = FieldTypography.bodyMedium,
-                                color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = entry.artist.uppercase(),
+                                text = (index + 1).toString().padStart(2, '0'),
                                 style = FieldTypography.labelSmall,
-                                color = skin.dim,
-                                maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                color = skin.accent,
+                                modifier = Modifier.width(32.dp)
                             )
-                        }
-                        if (entry.durationMs >= 0L) {
-                            Text(
-                                text = formatDuration(entry.durationMs),
-                                style = FieldTypography.labelSmall,
-                                color = skin.dim,
-                                modifier = Modifier.padding(horizontal = 8.dp)
-                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = entry.title.uppercase(),
+                                    style = FieldTypography.bodyMedium,
+                                    color = androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = entry.artist.uppercase(),
+                                    style = FieldTypography.labelSmall,
+                                    color = skin.dim,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                )
+                            }
+                            if (entry.durationMs >= 0L) {
+                                Text(
+                                    text = formatDuration(entry.durationMs),
+                                    style = FieldTypography.labelSmall,
+                                    color = skin.dim,
+                                    modifier = Modifier.padding(horizontal = 8.dp)
+                                )
+                            }
                         }
                         Box(
                             modifier = Modifier
                                 .size(48.dp)
-                                .clickable { onRemove(entry.entryId) }
+                                .clickable(
+                                    role = Role.Button,
+                                    onClickLabel = "Remove ${entry.title} from Up Next",
+                                    onClick = { onRemove(entry.entryId) }
+                                )
                                 .semantics {
                                     contentDescription = "Remove ${entry.title} from Up Next"
                                 },
@@ -750,7 +875,18 @@ fun FolderItem(name: String, isPlaying: Boolean = false, isHot: Boolean = false,
         modifier = Modifier
             .aspectRatio(1f)
             .background(if (isPlaying) skin.accent else skin.tile)
-            .clickable(onClick = onClick)
+            .clickable(
+                role = Role.Button,
+                onClickLabel = "Open album $name",
+                onClick = onClick
+            )
+            .semantics {
+                val states = buildList {
+                    if (isPlaying) add("Currently playing album")
+                    if (isHot) add("Contains Hot now tracks")
+                }
+                if (states.isNotEmpty()) stateDescription = states.joinToString(". ")
+            }
             .padding(8.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -797,7 +933,7 @@ fun TrackItem(
     isQueueSelected: Boolean = false,
     selectionPosition: Int? = null,
     selectionMode: Boolean = false,
-    queueEligible: Boolean = true,
+    queueBlockedReason: String? = null,
     selectionEnabled: Boolean = true,
     onLongClick: () -> Unit = {},
     onClick: () -> Unit
@@ -816,64 +952,85 @@ fun TrackItem(
     val queueBg: androidx.compose.ui.graphics.Brush =
         if (skin.isLcd) app.nogarbo.leflac.ui.components.rememberDitherBrush(skin.accent, 0.5f)
         else androidx.compose.ui.graphics.SolidColor(skin.accent.copy(alpha = 0.32f))
+    val rowState = buildList {
+        if (isPlaying) add("Currently playing")
+        if (isHot) add("Hot now")
+        when {
+            isQueueSelected -> add("Selected for Up Next position $selectionPosition")
+            upNextPosition != null -> add("Up Next position $upNextPosition")
+            selectionMode && queueBlockedReason != null -> add("Unavailable: $queueBlockedReason")
+        }
+    }.joinToString(". ")
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(64.dp) // Increased height for tech info
+            .heightIn(min = 64.dp)
             .alpha(if (selectionEnabled) 1f else 0.35f)
             .background(if (isQueueSelected) queueBg else if (isPlaying) playingBg else idleBg)
             .border(1.dp, if (isPlaying || isQueueSelected) skin.accent else Color.Transparent)
             .combinedClickable(
-                enabled = selectionEnabled,
+                enabled = true,
                 role = Role.Button,
                 onClickLabel = when {
                     isQueueSelected -> "Remove ${track.title} from selection"
+                    selectionMode && queueBlockedReason != null ->
+                        "Unavailable for Up Next: $queueBlockedReason"
                     selectionMode -> "Select ${track.title} for Up Next"
                     else -> "Play ${track.title}"
                 },
-                onLongClickLabel = if (isQueueSelected) {
-                    "Remove ${track.title} from Up Next selection"
-                } else {
-                    "Add ${track.title} to Up Next selection"
+                onLongClickLabel = when {
+                    isQueueSelected -> "Remove ${track.title} from Up Next selection"
+                    queueBlockedReason != null ->
+                        "Unavailable for Up Next: $queueBlockedReason"
+                    else -> "Add ${track.title} to Up Next selection"
                 },
-                onLongClick = onLongClick.takeIf { queueEligible },
+                onLongClick = onLongClick,
                 onClick = onClick
             )
             .semantics {
                 if (selectionMode) selected = isQueueSelected
-                when {
-                    isQueueSelected -> {
-                        stateDescription = "Selected for Up Next position $selectionPosition"
-                    }
-                    upNextPosition != null -> stateDescription = "Up Next position $upNextPosition"
-                }
+                if (rowState.isNotBlank()) stateDescription = rowState
             }
             .padding(horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Track Number / ID
-        Text(
-            text = String.format("%03d", track.id % 1000),
-            style = FieldTypography.labelSmall,
-            color = if (isPlaying) skin.accent else skin.dim,
+        Box(
             modifier = Modifier
-                .width(40.dp)
+                .size(48.dp)
                 .combinedClickable(
-                    enabled = selectionEnabled,
+                    enabled = true,
+                    role = Role.Button,
                     onClickLabel = if (selectionMode) {
                         "Toggle ${track.title} in Up Next selection"
                     } else {
-                        "Show service data for ${track.title}"
+                        if (serviceMode) "Hide service data for ${track.title}"
+                        else "Show service data for ${track.title}"
                     },
-                    onLongClickLabel = if (isQueueSelected) {
-                        "Remove ${track.title} from Up Next selection"
-                    } else {
-                        "Add ${track.title} to Up Next selection"
+                    onLongClickLabel = when {
+                        isQueueSelected -> "Remove ${track.title} from Up Next selection"
+                        queueBlockedReason != null ->
+                            "Unavailable for Up Next: $queueBlockedReason"
+                        else -> "Add ${track.title} to Up Next selection"
                     },
-                    onLongClick = onLongClick.takeIf { queueEligible },
-                    onClick = { if (selectionMode) onClick() else serviceMode = true }
-                )
-        )
+                    onLongClick = onLongClick,
+                    onClick = { if (selectionMode) onClick() else serviceMode = !serviceMode }
+                ),
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Text(
+                text = String.format("%03d", track.id % 1000),
+                style = FieldTypography.labelSmall,
+                color = if (isPlaying) skin.accent else skin.dim
+            )
+        }
+
+        val queueMarker = when {
+            selectionPosition != null -> "S${compactQueueCount(selectionPosition)}"
+            upNextPosition != null -> "N${compactQueueCount(upNextPosition)}"
+            else -> null
+        }
+        val durationLabel = formatDuration(track.duration)
 
         Column(modifier = Modifier.weight(1f)) {
             if (serviceMode) {
@@ -885,31 +1042,71 @@ fun TrackItem(
                     app.nogarbo.leflac.data.TrackProfileStore.get(context, track.uri.toString())
                 }
                 val daysAgo = if (stats.t > 0) (System.currentTimeMillis() - stats.t) / 86_400_000L else -1L
-                Row(verticalAlignment = Alignment.Bottom) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text(
                         text = "SERVICE // ${stats.p} PLAYS · ${stats.s} SKIPS",
                         style = FieldTypography.bodyMedium,
                         maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                         color = skin.accent,
                         modifier = Modifier.weight(1f, fill = false)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
+                    Box(
+                        modifier = Modifier
+                            // Keep the printed service line compact; clickable
+                            // supplies the 48dp pointer expansion without a
+                            // 48dp-high face crowding the detail line below.
+                            .width(48.dp)
+                            .height(24.dp)
+                            .clickable(
+                                role = Role.Button,
+                                onClickLabel = "Hide service data for ${track.title}",
+                                onClick = { serviceMode = false }
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "[EXIT]",
+                            style = FieldTypography.labelSmall.copy(fontSize = 8.sp),
+                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                            color = skin.accent
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    if (queueMarker != null) {
+                        Text(
+                            text = queueMarker,
+                            style = FieldTypography.labelSmall,
+                            color = skin.accent,
+                            maxLines = 1
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
                     Text(
-                        text = "[EXIT]",
-                        style = FieldTypography.labelSmall.copy(fontSize = 8.sp),
-                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                        color = skin.accent,
-                        modifier = Modifier.clickable { serviceMode = false }
+                        text = durationLabel,
+                        style = FieldTypography.labelSmall,
+                        color = if (isPlaying) skin.accent else
+                            androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                        maxLines = 1,
+                        textAlign = TextAlign.End
                     )
                 }
                 Text(
                     text = "HEAT ${"%.1f".format(heat)} · ${if (profile?.bpm ?: 0 > 0) "${profile!!.bpm}BPM · " else ""}LAST ${if (daysAgo >= 0) "${daysAgo}D AGO" else "NEVER"} · ${track.extension} ${track.bitrate}KBPS",
                     style = FieldTypography.labelSmall,
                     color = skin.dim,
-                    maxLines = 1
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                 )
             } else {
-            Row(verticalAlignment = Alignment.Bottom) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Bottom
+            ) {
                 Text(
                     text = track.title.uppercase(),
                     style = FieldTypography.bodyMedium,
@@ -940,6 +1137,24 @@ fun TrackItem(
                         } else skin.rng.copy(alpha = (gymRating / 0.40f).coerceIn(0.35f, 1f))
                     )
                 }
+                Spacer(modifier = Modifier.width(8.dp))
+                if (queueMarker != null) {
+                    Text(
+                        text = queueMarker,
+                        style = FieldTypography.labelSmall,
+                        color = skin.accent,
+                        maxLines = 1
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
+                Text(
+                    text = durationLabel,
+                    style = FieldTypography.labelSmall,
+                    color = if (isPlaying) skin.accent else
+                        androidx.compose.material3.MaterialTheme.colorScheme.onBackground,
+                    maxLines = 1,
+                    textAlign = TextAlign.End
+                )
             }
             Text(
                 text = track.artist.uppercase(),
@@ -951,26 +1166,6 @@ fun TrackItem(
             }
         }
 
-        if (selectionPosition != null) {
-            Text(
-                text = "S${selectionPosition.coerceAtMost(99).toString().padStart(2, '0')}",
-                style = FieldTypography.labelSmall,
-                color = skin.accent,
-                modifier = Modifier.padding(end = 8.dp)
-            )
-        } else if (upNextPosition != null) {
-            Text(
-                text = "N${upNextPosition.coerceAtMost(99).toString().padStart(2, '0')}",
-                style = FieldTypography.labelSmall,
-                color = skin.accent,
-                modifier = Modifier.padding(end = 8.dp)
-            )
-        }
-        Text(
-            text = formatDuration(track.duration),
-            style = FieldTypography.labelSmall,
-             color = if (isPlaying) skin.accent else androidx.compose.material3.MaterialTheme.colorScheme.onBackground
-        )
     }
 }
 
@@ -1009,17 +1204,27 @@ fun ScanField(query: String, onQueryChange: (String) -> Unit) {
             cursorBrush = androidx.compose.ui.graphics.SolidColor(skin.accent),
             modifier = Modifier
                 .weight(1f)
+                .semantics { contentDescription = "Search songs and mixes" }
                 .border(1.dp, if (query.isBlank()) skin.dim else skin.accent)
                 .padding(horizontal = 8.dp, vertical = 6.dp)
         )
         if (query.isNotBlank()) {
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "[X]",
-                style = FieldTypography.labelMedium,
-                color = skin.accent,
-                modifier = Modifier.clickable { onQueryChange("") }
-            )
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Clear library search",
+                        onClick = { onQueryChange("") }
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "[X]",
+                    style = FieldTypography.labelMedium,
+                    color = skin.accent
+                )
+            }
         }
     }
 }
