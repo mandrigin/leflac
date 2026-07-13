@@ -234,8 +234,8 @@ scripts/push_music.sh DIR   # push a folder of music to the device
 
 The final v1.3 sideload build is attached to the
 [v1.3.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.3.0).
-Its immediately preceding candidate was phone-tested; the release notes record
-the final compact service-control spacing delta that awaits the next install.
+The exact release asset was installed on the Nothing A024 and pulled back with
+the same SHA-256 recorded in the release notes.
 That APK uses the development/debug signing key and is intended for direct
 testing, not store distribution. Upgrade preservation requires the installed
 copy to use the same signing key. Version 1.3.0 uses Media3 1.10.1 and API 36
