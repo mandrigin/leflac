@@ -6,8 +6,7 @@ import app.nogarbo.leflac.service.AudioTrackAnalyzer
 import app.nogarbo.leflac.service.AudioTrackAnalyzer.AnalysisFrame
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Manages audio analysis tasks:
@@ -29,9 +28,11 @@ class AnalysisRepository(private val context: Context) {
     private val backgroundQueue = kotlinx.coroutines.channels.Channel<Uri>(kotlinx.coroutines.channels.Channel.UNLIMITED)
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var backgroundJob: Job? = null
+    @Volatile private var currentBackgroundAnalysisJob: Job? = null
     
     // Track "Now Playing" state to manage contention
     private val _isNowPlayingActive = MutableStateFlow(false)
+    private val nowPlayingRequestCount = AtomicInteger(0)
     
     init {
         scope.launch { analyzer.purgeLegacyCaches() }
@@ -61,12 +62,38 @@ class AnalysisRepository(private val context: Context) {
                 }
                 
                 android.util.Log.d("FLAC_BG", "Background Analysis starting for $uri")
-                try {
-                    // Run analysis (blocking/suspend)
-                    // We don't need partial results for background work
-                    analyzer.analyze(uri)
-                } catch (e: Exception) {
-                    android.util.Log.w("FLAC_BG", "Background Analysis failed/skipped for $uri", e)
+                val analysisJob = launch(start = CoroutineStart.LAZY) {
+                    try {
+                        analyzer.analyze(uri)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        android.util.Log.w("FLAC_BG", "Background Analysis failed/skipped for $uri", e)
+                    }
+                }
+                currentBackgroundAnalysisJob = analysisJob
+                // Close the hand-off race between observing the idle flag and
+                // publishing the cancellable job. A newly started foreground
+                // request either cancels this lazy job or makes this check true.
+                if (_isNowPlayingActive.value) {
+                    if (currentBackgroundAnalysisJob === analysisJob) {
+                        currentBackgroundAnalysisJob = null
+                    }
+                    analysisJob.cancel()
+                    backgroundQueue.send(uri)
+                    continue
+                }
+                analysisJob.start()
+                analysisJob.join()
+                if (currentBackgroundAnalysisJob === analysisJob) {
+                    currentBackgroundAnalysisJob = null
+                }
+                // Now-playing work may preempt a sweep item. Put it at the
+                // tail so no song is permanently lost from the v4 rebuild.
+                if (analysisJob.isCancelled && scope.isActive &&
+                    !app.nogarbo.leflac.data.TrackProfileStore.has(context, uri.toString())
+                ) {
+                    backgroundQueue.send(uri)
                 }
                 
                 // Yield to allow UI interactions or cancellation checks
@@ -81,25 +108,20 @@ class AnalysisRepository(private val context: Context) {
      * thanks to the suspend function in AudioTrackAnalyzer checking for cancellation.
      */
     fun analyzeNowPlaying(uri: Uri, forceRegenerate: Boolean = false): Flow<List<AnalysisFrame>> = channelFlow {
-        // Mark as active to pause background work
-        _isNowPlayingActive.value = true
-        
-        // Cancel current background stanza immediately to free up CPU?
-        // The background loop checks `_isNowPlayingActive` before *starting* a track.
-        // But if it's *in the middle* of a track, we might want to cancel it?
-        // Yes, for "Now Playing" we want CPU *now*.
-        // We can restart the background job or cancel the current specific analysis.
-        // However, cancelling the *whole* background loop loses the queue position if using `for(uri in queue)`.
-        // Actually, Channel iteration doesn't lose items if we just cancel the *processing* of one item.
-        // But we can't easily cancel *just* the analyzer call inside the loop from here without complex job management.
-        
-        // Hack: We rely on the OS slicing, or we implement a "Current Background Job" ref.
-        // For simplicity/safety, we just let the background task finish its current file (max few seconds) OR pause...
-        // The user said "even cancelling".
-        // Let's rely on `_isNowPlayingActive` check blocking *next* items. 
-        // To cancel *current* item, we'd need `currentBackgroundAnalysisJob?.cancel()`.
-        
+        // A track switch cancels the prior collector without synchronously
+        // joining it. Count overlapping hand-offs so the old request's finally
+        // block cannot briefly resume the background sweep under the new one.
+        if (nowPlayingRequestCount.incrementAndGet() == 1) {
+            _isNowPlayingActive.value = true
+        }
         try {
+            currentBackgroundAnalysisJob?.let { background ->
+                background.cancelAndJoin()
+                if (currentBackgroundAnalysisJob === background) {
+                    currentBackgroundAnalysisJob = null
+                }
+            }
+
             // 1. Fast Path
             if (!forceRegenerate) {
                 val cached = analyzer.checkCache(uri)
@@ -117,7 +139,9 @@ class AnalysisRepository(private val context: Context) {
             send(finalResult)
             
         } finally {
-            _isNowPlayingActive.value = false
+            if (nowPlayingRequestCount.decrementAndGet() == 0) {
+                _isNowPlayingActive.value = false
+            }
         }
     }
     

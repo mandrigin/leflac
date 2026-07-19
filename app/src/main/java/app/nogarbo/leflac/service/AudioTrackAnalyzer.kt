@@ -74,7 +74,7 @@ class AudioTrackAnalyzer(private val context: Context) {
         }
         
         val timeline = rawTimeline ?: return emptyList()
-        saveProfileIfMissing(uri, timeline)
+        saveProfileIfMissing(uri, timeline, replace = forceRegenerate)
 
         // --- POST PROCESSING (ALWAYS RUN LIVE) ---
         // 2.2. Song-relative epic detection
@@ -94,6 +94,7 @@ class AudioTrackAnalyzer(private val context: Context) {
         android.util.Log.i("FLAC_PERF", "Starting Analysis for $uri (Regen=true)")
         
         val extractor = MediaExtractor()
+        var reachedEndOfStream = false
         
         try {
             extractor.setDataSource(context, uri, null)
@@ -129,8 +130,10 @@ class AudioTrackAnalyzer(private val context: Context) {
             codec.configure(format, null, null, 0)
             codec.start()
             
-            val channelCount = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) ?: 2
-            val frameStride = if (channelCount >= 2) 4 else 2
+            val channelCount = (format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) ?: 2)
+                .coerceAtLeast(1)
+            val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE) ?: 44_100
+            val frameStride = channelCount * 2
             
             val info = MediaCodec.BufferInfo()
             var isEOS = false
@@ -140,6 +143,7 @@ class AudioTrackAnalyzer(private val context: Context) {
             val fftSize = 1024
             val bufferAccumulator = FloatArray(fftSize)
             var bufferIndex = 0
+            var decodedPcmFrames = 0L
 
             // Mixes (>= 20 min) only need "basic spectral": analyze every
             // Nth FFT window instead of all of them. ~8x less CPU and cache,
@@ -197,18 +201,29 @@ class AudioTrackAnalyzer(private val context: Context) {
                          if (pcmChunk.size < info.size) {
                              pcmChunk = ByteArray(info.size + 1024)
                          }
+                         outputBuffer.position(info.offset)
+                         outputBuffer.limit(info.offset + info.size)
                          outputBuffer.get(pcmChunk, 0, info.size)
                          outputBuffer.clear()
                          
                          var i = 0
                          while (i <= info.size - frameStride) { 
-                             val low = pcmChunk[i].toInt() and 0xFF
-                             val high = pcmChunk[i+1].toInt()
-                             val s = (high shl 8) or low
-                             val sample = s / 32768.0f
-                             
+                             // Downmix every decoded channel. Reading only the
+                             // left channel made workout profiles depend on a
+                             // track's stereo placement.
+                             var sample = 0f
+                             for (channel in 0 until channelCount) {
+                                 val offset = i + channel * 2
+                                 val low = pcmChunk[offset].toInt() and 0xFF
+                                 val high = pcmChunk[offset + 1].toInt()
+                                 val value = (high shl 8) or low
+                                 sample += value / 32768.0f
+                             }
+                             sample /= channelCount
+
                              bufferAccumulator[bufferIndex] = sample
                              bufferIndex++
+                             decodedPcmFrames++
                              
                              if (bufferIndex >= fftSize) {
                                  bufferIndex = 0
@@ -224,9 +239,11 @@ class AudioTrackAnalyzer(private val context: Context) {
                                      fftNorm[k] = fftMags[k] / 5.0f
                                  }
 
-                                  val sampleRate = format?.getInteger(MediaFormat.KEY_SAMPLE_RATE) ?: 44100
                                   val state = analysisLogic.processMagnitudes(fftNorm, sampleRate)
-                                 val timeMs = info.presentationTimeUs / 1000
+                                 // Codec PTS belongs to the whole output buffer;
+                                 // sample count gives each FFT window its real
+                                 // position and stabilizes tempo estimation.
+                                 val timeMs = decodedPcmFrames * 1_000L / sampleRate
 
                                  timeline.add(AnalysisFrame(timeMs, state))
                                  
@@ -247,6 +264,7 @@ class AudioTrackAnalyzer(private val context: Context) {
                      
                      if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                          outputDone = true
+                         reachedEndOfStream = true
                      }
                      outputIndex = codec.dequeueOutputBuffer(info, 500)
                 }
@@ -264,78 +282,47 @@ class AudioTrackAnalyzer(private val context: Context) {
             extractor.release()
         }
         
-        // Finalize ONLY if we finished naturally (no cancellation thrown above)
-        // If we constitute this point, we assume success or benign error that didn't throw
-        
-        if (timeline.isEmpty()) return emptyList()
+        // Never cache/profile a decoder prefix as if it were a whole song.
+        if (!reachedEndOfStream || timeline.isEmpty()) return emptyList()
 
         return timeline
     }
 
-    /** Gym profile: mean energy, dynamics, BPM — cheap, cached forever. */
-    private fun saveProfileIfMissing(uri: Uri, frames: List<AnalysisFrame>) {
+    /** Activity profile derived from the cached spectral pass. */
+    private fun saveProfileIfMissing(
+        uri: Uri,
+        frames: List<AnalysisFrame>,
+        replace: Boolean = false
+    ) {
         try {
             val key = uri.toString()
-            if (app.nogarbo.leflac.data.TrackProfileStore.has(context, key)) return
-            if (frames.size < 200) return
-            val energies = FloatArray(frames.size) {
-                val st = frames[it].state
-                (st.kick * 0.8f + st.snare + st.cymbals * 0.8f) / 2.6f
-            }
-            val sorted = energies.clone().also { it.sort() }
-            val p25 = sorted[(0.25 * (sorted.size - 1)).toInt()]
-            val p90 = sorted[(0.90 * (sorted.size - 1)).toInt()]
-            val mean = energies.average().toFloat()
-            val meanKick = frames.map { it.state.kick }.average().toFloat()
-            val bpm = estimateBpm(frames)
+            if (!replace && app.nogarbo.leflac.data.TrackProfileStore.has(context, key)) return
+            val profile = app.nogarbo.leflac.data.WorkoutProfileAnalyzer.analyze(
+                frames.map { frame ->
+                    val state = frame.state
+                    app.nogarbo.leflac.data.WorkoutFrame(
+                        timestampMs = frame.timestampMs,
+                        // The kick body's upper harmonics live in the adjacent
+                        // bass band; blend both instead of trusting one ~43 Hz bin.
+                        kick = (0.65f * state.kick + 0.35f * state.bassGuitar)
+                            .coerceIn(0f, 1f),
+                        snare = state.snare,
+                        cymbals = state.cymbals,
+                        vocal = state.vocal,
+                        synth = state.synth
+                    )
+                }
+            ) ?: return
             app.nogarbo.leflac.data.TrackProfileStore.put(
-                context, key,
-                app.nogarbo.leflac.data.TrackProfileStore.Profile(mean, p90 - p25, bpm, meanKick)
+                context,
+                key,
+                profile
             )
-            android.util.Log.i("FLAC_PROFILE", "$key e=$mean d=${p90 - p25} bpm=$bpm")
+            android.util.Log.i(
+                "FLAC_PROFILE",
+                "$key e=${profile.e} bpm=${profile.bpm} rhythm=${profile.r} impact=${profile.k}"
+            )
         } catch (e: Exception) { e.printStackTrace() }
-    }
-
-    /**
-     * Tempo from the cached kick curve: resample to a 50ms grid, then pick
-     * the strongest autocorrelation lag in the 60-190 BPM window (octave
-     * errors folded into range).
-     */
-    private fun estimateBpm(frames: List<AnalysisFrame>): Int {
-        val stepMs = 50L
-        val durMs = frames.last().timestampMs
-        if (durMs < 30_000) return 0
-        val n = (durMs / stepMs).toInt().coerceAtMost(6000)
-        val grid = FloatArray(n)
-        var fi = 0
-        for (i in 0 until n) {
-            val t = i * stepMs
-            while (fi < frames.size - 1 && frames[fi + 1].timestampMs <= t) fi++
-            grid[i] = frames[fi].state.kick
-        }
-        val meanV = grid.average().toFloat()
-        for (i in grid.indices) grid[i] -= meanV
-        val minLag = (60_000f / 180f / stepMs).toInt() // 180 BPM
-        val maxLag = (60_000f / 60f / stepMs).toInt()  // 60 BPM
-        val r = FloatArray(maxLag + 2)
-        for (lag in minLag - 1..maxLag + 1) {
-            var acc = 0f
-            var i = 0
-            while (i + lag < n) { acc += grid[i] * grid[i + lag]; i++ }
-            r[lag.coerceIn(0, r.size - 1)] = acc / (n - lag)
-        }
-        // a real tempo peak is a LOCAL maximum — the trivial adjacent-lag
-        // correlation slope otherwise wins and pins everything at the edge
-        var bestLag = 0; var best = 0f
-        for (lag in (minLag + 1) until maxLag) { // boundaries can't be peaks
-            if (r[lag] > best && r[lag] > r[lag - 1] && r[lag] >= r[lag + 1]) {
-                best = r[lag]; bestLag = lag
-            }
-        }
-        if (bestLag == 0) return 0
-        var bpm = (60_000f / (bestLag * stepMs)).toInt()
-        while (bpm < 90) bpm *= 2 // fold low octaves into the useful range
-        return bpm
     }
 
     private fun generateCacheKey(uri: Uri): String? {
@@ -364,7 +351,7 @@ class AudioTrackAnalyzer(private val context: Context) {
     
     // Simple MD5
     private fun md5(s: String): String {
-        val CACHE_VERSION = "delta_v8_GZ" // Forced Reset for Cache Fix (Now storing RAW)
+        val CACHE_VERSION = "delta_v9_GZ" // FFT/timestamps/downmix + workout profile reset
         val versioned = "$s|$CACHE_VERSION"
         val digest = MessageDigest.getInstance("MD5")
         val bytes = digest.digest(versioned.toByteArray())

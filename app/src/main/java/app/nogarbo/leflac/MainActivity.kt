@@ -134,6 +134,7 @@ class MainActivity : ComponentActivity() {
                 val isShuffleEnabled by playbackViewModel.isShuffleEnabled.collectAsState()
                 val currentMediaId by playbackViewModel.currentMediaId.collectAsState()
                 val upNext by playbackViewModel.upNext.collectAsState()
+                val mixHeatSnapshot by playbackViewModel.mixHeat.collectAsState()
                 val hasMedia = currentMediaId != null
                 val isMixPlaying = hasMedia &&
                     duration >= app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS
@@ -264,8 +265,15 @@ class MainActivity : ComponentActivity() {
                             .fillMaxSize()
                     ) {
                         val gymOn by playbackViewModel.gymMode.collectAsState()
+                        val workoutMode by playbackViewModel.workoutMode.collectAsState()
                         val position by playbackViewModel.position.collectAsState()
                         val cuePoints by playbackViewModel.cuePoints.collectAsState()
+                        val mixSegments = if (mixHeatSnapshot.mediaId == currentMediaId) {
+                            mixHeatSnapshot.segments
+                        } else {
+                            emptyList()
+                        }
+                        val hotMixSegments = mixSegments.filter { it.isHot }
 
                         // Racked sideways the unit becomes a desk deck: faceplate
                         // and transport on the left, the ledger as a side panel.
@@ -286,6 +294,7 @@ class MainActivity : ComponentActivity() {
                             cueIndex = if (isMixPlaying && cuePoints.isNotEmpty())
                                 cuePoints.count { it <= position } else -1,
                             gymOn = gymOn,
+                            workoutMode = workoutMode,
                             onGymEnd = { playbackViewModel.setGymMode(false) },
                             onNameplate = { rearVisible = true },
                             modifier = Modifier.fillMaxWidth()
@@ -415,30 +424,46 @@ class MainActivity : ComponentActivity() {
                                     return if (h > 0) String.format("%d:%02d:%02d", h, m, s)
                                         else String.format("%02d:%02d", m, s)
                                 }
-                                // Current segment start plus the next two cues
+                                // Current + next stay local; the third slot is
+                                // the hottest learned jump elsewhere in the set.
                                 val ladder = buildList {
-                                    add(cueIdx to (if (cueIdx > 0) cuePoints[cueIdx - 1] else 0L))
-                                    if (cueIdx < cuePoints.size) add(cueIdx + 1 to cuePoints[cueIdx])
-                                    if (cueIdx + 1 < cuePoints.size) add(cueIdx + 2 to cuePoints[cueIdx + 1])
+                                    val currentStart = if (cueIdx > 0) cuePoints[cueIdx - 1] else 0L
+                                    add(Triple(cueIdx, currentStart, hotMixSegments.any { it.index == cueIdx }))
+                                    if (cueIdx < cuePoints.size) {
+                                        add(Triple(cueIdx + 1, cuePoints[cueIdx], hotMixSegments.any { it.index == cueIdx + 1 }))
+                                    }
+                                    val used = map { it.first }.toSet()
+                                    val hottest = hotMixSegments
+                                        .filterNot { it.index in used }
+                                        .maxByOrNull { it.relativeHeat }
+                                    if (hottest != null) {
+                                        add(Triple(hottest.index, hottest.startMs, true))
+                                    } else if (cueIdx + 1 < cuePoints.size) {
+                                        add(Triple(cueIdx + 2, cuePoints[cueIdx + 1], false))
+                                    }
                                 }
                                 Column(
                                     modifier = Modifier
                                         .align(Alignment.BottomStart)
                                         .padding(start = 16.dp, bottom = 32.dp)
                                 ) {
-                                    ladder.forEachIndexed { i, (n, ms) ->
+                                    ladder.forEachIndexed { i, (n, ms, isHot) ->
                                         val isCurrent = i == 0
                                         Text(
-                                            text = "${if (isCurrent) "▸" else " "} CUE ${String.format("%02d", n)} · ${cueTime(ms)}",
+                                            text = "${if (isCurrent) "▸" else " "} ${if (isHot) "HOT CUE" else "CUE"} ${String.format("%02d", n)} · ${cueTime(ms)}",
                                             style = ladderStyle,
                                             fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                                             fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-                                            color = if (isCurrent) skin.accent else skin.dim,
+                                            color = when {
+                                                isCurrent -> skin.accent
+                                                isHot -> skin.rng
+                                                else -> skin.dim
+                                            },
                                             maxLines = 1,
                                             modifier = Modifier
                                                 .clickable(
                                                     role = Role.Button,
-                                                    onClickLabel = "Seek to cue $n at ${cueTime(ms)}",
+                                                    onClickLabel = "Seek to ${if (isHot) "hot " else ""}cue $n at ${cueTime(ms)}",
                                                     onClick = { playbackViewModel.seekTo(ms) }
                                                 )
                                                 .padding(vertical = 2.dp)
@@ -454,7 +479,8 @@ class MainActivity : ComponentActivity() {
                                 } ?: 0 else 0
                             }
                             val telemetry = if (isMixPlaying) {
-                                (if (mixBpm > 0) "BPM:$mixBpm · " else "") + "CUES:${cuePoints.size}"
+                                (if (mixBpm > 0) "BPM:$mixBpm · " else "") +
+                                    "CUES:${cuePoints.size} · HOT:${hotMixSegments.size}"
                             } else {
                                 "K:${(spectrum.kick * 10).toInt()} B:${(spectrum.bassGuitar * 10).toInt()} S:${(spectrum.snare * 10).toInt()} G:${(spectrum.guitar * 10).toInt()} V:${(spectrum.vocal * 10).toInt()} Y:${(spectrum.synth * 10).toInt()} C:${(spectrum.cymbals * 10).toInt()}"
                             }
@@ -567,6 +593,7 @@ class MainActivity : ComponentActivity() {
                                         history = history,
                                         fullTimeline = fullTimeline,
                                         cuePoints = cuePoints,
+                                        hotSegments = hotMixSegments,
                                         onSeek = { pos -> playbackViewModel.seekTo(pos) },
                                         modifier = Modifier.align(Alignment.Center)
                                     )
@@ -732,7 +759,7 @@ class MainActivity : ComponentActivity() {
                                   viewModel = libraryViewModel,
                                   playingTrackId = currentMediaId,
                                   upNext = upNext,
-                                  onGymStart = { playbackViewModel.setGymMode(true) },
+                                  onGymStart = playbackViewModel::startWorkout,
                                   onTracksQueued = { tracks ->
                                       val outcome = playbackViewModel.scheduleUpNext(
                                           tracks,
@@ -763,30 +790,9 @@ class MainActivity : ComponentActivity() {
                                   onUpNextRemoved = playbackViewModel::removeFromUpNext,
                                   onUpNextCleared = playbackViewModel::clearUpNext,
                                   onTrackSelected = { track ->
-                                       // Smart queue stays within the track's pool: mixes shuffle
-                                       // among mixes, songs among songs.
-                                       val allTracks = libraryViewModel.allTracks.value
-                                       val playlist = if (isShuffleEnabled) {
-                                           playbackViewModel.generateSmartQueue(allTracks, track)
-                                       } else {
-                                           app.nogarbo.leflac.service.playbackPool(allTracks, track)
-                                       }
-
-                                       val uris = ArrayList<android.os.Parcelable>(playlist.map { it.uri })
-                                       val titles = ArrayList<String>(playlist.map { it.title })
-                                       val artists = ArrayList<String>(playlist.map { it.artist })
-                                       val durations = playlist.map { it.duration }.toLongArray()
-                                       val startIndex = if (isShuffleEnabled) 0 else playlist.indexOf(track).coerceAtLeast(0)
-
-                                       val intent = Intent(context, app.nogarbo.leflac.service.AudioService::class.java)
-                                       intent.action = app.nogarbo.leflac.service.AudioCommandBus.ACTION_PLAY_LIST
-                                       intent.putParcelableArrayListExtra("URIS", uris)
-                                       intent.putStringArrayListExtra("TITLES", titles)
-                                       intent.putStringArrayListExtra("ARTISTS", artists)
-                                       intent.putExtra("DURATIONS", durations)
-                                       intent.putExtra("START_INDEX", startIndex)
-                                       context.startForegroundService(
-                                           app.nogarbo.leflac.service.AudioCommandBus.authorize(intent)
+                                       playbackViewModel.playTrackFromLibrary(
+                                           libraryViewModel.allTracks.value,
+                                           track
                                        )
                                   }
                              )
@@ -943,6 +949,7 @@ fun SystemStrip(
     isShuffleEnabled: Boolean,
     cueIndex: Int, // -1 = not a mix, or no cue map yet
     gymOn: Boolean,
+    workoutMode: app.nogarbo.leflac.data.WorkoutMode? = null,
     onGymEnd: () -> Unit,
     onNameplate: () -> Unit = {},
     modifier: Modifier = Modifier
@@ -1026,7 +1033,7 @@ fun SystemStrip(
         )
         if (gymOn) {
             Text(
-                text = " · [GYM · TAP TO END]",
+                text = " · [${workoutMode?.displayName ?: "GYM"} · END]",
                 style = stripStyle,
                 fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                 fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
@@ -1034,7 +1041,7 @@ fun SystemStrip(
                 maxLines = 1,
                 modifier = Modifier.clickable(
                     role = Role.Button,
-                    onClickLabel = "End gym mode",
+                    onClickLabel = "End ${workoutMode?.displayName?.lowercase() ?: "gym"} mode",
                     onClick = onGymEnd
                 )
             )

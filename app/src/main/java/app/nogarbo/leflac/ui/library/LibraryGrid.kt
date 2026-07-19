@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
@@ -39,6 +40,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.nogarbo.leflac.data.AudioTrack
+import app.nogarbo.leflac.data.WorkoutMode
+import app.nogarbo.leflac.service.QueueEntryOrigin
 import app.nogarbo.leflac.service.UpNextEntry
 import app.nogarbo.leflac.service.queuePool
 import app.nogarbo.leflac.ui.theme.FieldTypography
@@ -49,12 +52,58 @@ private const val TAB_MIXES = 1
 private const val TAB_ALBUMS = 2
 private const val TAB_UP_NEXT = 3
 
+internal data class DeckCommandSuggestion(
+    val command: String,
+    val description: String,
+    val aliases: Set<String> = emptySet()
+)
+
+private val deckCommandCatalog = listOf(
+    DeckCommandSuggestion(".hot", "Your current heat"),
+    DeckCommandSuggestion(".gym", "Choose a training profile"),
+    DeckCommandSuggestion(".cardio", "Steady endurance drive"),
+    DeckCommandSuggestion(".weights", "Impact for lifting", setOf(".weight")),
+    DeckCommandSuggestion(".grit", "Aggressive sustained drive", setOf(".grift")),
+    DeckCommandSuggestion(".static", "Holds & mobility"),
+    DeckCommandSuggestion(".mix", "Every long cassette"),
+    DeckCommandSuggestion(".rng", "Ten songs at random")
+)
+
+private fun deckCommandTokens(suggestion: DeckCommandSuggestion): Sequence<String> =
+    sequenceOf(suggestion.command) + suggestion.aliases.asSequence()
+
+/** Canonical suggestions for a partial dot/legacy-chevron deck command. */
+internal fun matchingDeckCommandSuggestions(query: String): List<DeckCommandSuggestion> {
+    val normalized = query.trim().lowercase()
+    if (normalized.firstOrNull() != '.' && normalized.firstOrNull() != '>') return emptyList()
+    val fragment = normalized.drop(1)
+    return deckCommandCatalog.filter { suggestion ->
+        val tokens = deckCommandTokens(suggestion).map { it.drop(1) }.toList()
+        tokens.any { it.startsWith(fragment) } && tokens.none { it == fragment }
+    }
+}
+
+internal fun resolvesDeckCommand(query: String): Boolean {
+    val normalized = query.trim().lowercase()
+    if (normalized.firstOrNull() != '.' && normalized.firstOrNull() != '>') return false
+    val fragment = normalized.drop(1)
+    return deckCommandCatalog.any { suggestion ->
+        deckCommandTokens(suggestion).any { it.drop(1) == fragment }
+    }
+}
+
+private data class WorkoutSearchSnapshot(
+    val candidates: List<app.nogarbo.leflac.data.WorkoutCandidate> = emptyList(),
+    val unprofiledCount: Int = 0,
+    val isLoading: Boolean = false
+)
+
 @Composable
 fun LibraryGrid(
     viewModel: LibraryViewModel,
     playingTrackId: String? = null,
     upNext: List<UpNextEntry> = emptyList(),
-    onGymStart: () -> Unit = {},
+    onGymStart: (WorkoutMode) -> Unit = {},
     onTracksQueued: (List<AudioTrack>) -> Boolean = { false },
     onQueueBlocked: (String) -> Unit = {},
     onUpNextRemoved: (String) -> Unit = {},
@@ -79,7 +128,8 @@ fun LibraryGrid(
     val selectedForQueue = selectedQueueIds.mapNotNull(libraryById::get)
     val selectionActive = selectedForQueue.isNotEmpty()
     val queuedPositions = remember(upNext) {
-        upNext.mapIndexed { index, entry -> entry.mediaId to (index + 1) }
+        upNext.filter { it.origin == QueueEntryOrigin.MANUAL }
+            .mapIndexed { index, entry -> entry.mediaId to (index + 1) }
             .toMap()
     }
     val playingPool = remember(playingTrackId, tracks, mixes) {
@@ -169,38 +219,77 @@ fun LibraryGrid(
     }
 
     val scanContext = androidx.compose.ui.platform.LocalContext.current
+    val profileRevision by app.nogarbo.leflac.data.TrackProfileStore.revision.collectAsState()
 
     // SCAN: type-to-filter across songs and mixes
     var searchQuery by rememberSaveable { androidx.compose.runtime.mutableStateOf("") }
-    val isGymQuery = searchQuery.trim().lowercase().let { it == ">gym" || it == ".gym" }
-    val searchResults = remember(searchQuery, tracks, mixes, hotTracks) {
-        val q = searchQuery.trim()
-        // Deck commands accept > or . — the dot needs no keyboard switch
-        val cmd = if (q.startsWith(">") || q.startsWith(".")) q.drop(1).lowercase() else null
+    var selectedWorkoutMode by rememberSaveable {
+        androidx.compose.runtime.mutableStateOf(WorkoutMode.CARDIO)
+    }
+    val trimmedQuery = searchQuery.trim()
+    // Deck commands accept > or . — the dot needs no keyboard switch.
+    val command = if (trimmedQuery.startsWith(">") || trimmedQuery.startsWith(".")) {
+        trimmedQuery.drop(1).lowercase()
+    } else null
+    val isDeckCommandPrefix = trimmedQuery.startsWith(".") || trimmedQuery.startsWith(">")
+    val commandSuggestions = remember(trimmedQuery) {
+        matchingDeckCommandSuggestions(trimmedQuery)
+    }
+    val resolvesCommand = remember(trimmedQuery) { resolvesDeckCommand(trimmedQuery) }
+    val directWorkoutMode = WorkoutMode.fromCommand(command)
+    val isWorkoutQuery = command == "gym" || directWorkoutMode != null
+    val activeWorkoutMode = directWorkoutMode ?: selectedWorkoutMode
+    androidx.compose.runtime.LaunchedEffect(directWorkoutMode) {
+        if (directWorkoutMode != null) selectedWorkoutMode = directWorkoutMode
+    }
+    val workoutSnapshot by androidx.compose.runtime.produceState(
+        WorkoutSearchSnapshot(),
+        isWorkoutQuery,
+        activeWorkoutMode,
+        tracks,
+        profileRevision
+    ) {
+        value = WorkoutSearchSnapshot(isLoading = isWorkoutQuery)
+        if (isWorkoutQuery) {
+            value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                WorkoutSearchSnapshot(
+                    candidates = app.nogarbo.leflac.data.workoutCandidates(
+                        context = scanContext,
+                        tracks = tracks,
+                        mode = activeWorkoutMode
+                    ),
+                    unprofiledCount = tracks.count {
+                        app.nogarbo.leflac.data.TrackProfileStore.get(
+                            scanContext,
+                            it.uri.toString()
+                        ) == null
+                    },
+                    isLoading = false
+                )
+            }
+        }
+    }
+    val workoutCatalog = workoutSnapshot.candidates
+    val workoutRatings = remember(workoutCatalog) {
+        workoutCatalog.associate { it.track.uri.toString() to it.rating }
+    }
+    val unprofiledWorkoutCount = workoutSnapshot.unprofiledCount
+    val searchResults = remember(
+        searchQuery,
+        command,
+        tracks,
+        mixes,
+        hotTracks,
+        workoutCatalog
+    ) {
+        val q = trimmedQuery
         when {
             q.isBlank() -> emptyList()
-            cmd == "hot" -> hotTracks
-            cmd == "mix" -> mixes
-            cmd == "rng" -> tracks.shuffled().take(10)
-            // The gym set: relentless tracks, ranked by flat-loud score.
-            // BPM shows in service mode (tap the badge).
-            cmd == "gym" -> tracks
-                .mapNotNull { t ->
-                    val key = t.uri.toString()
-                    val p = app.nogarbo.leflac.data.TrackProfileStore.get(scanContext, key)
-                    // Relentlessness plus YOUR signal: hot tracks train too.
-                    // No profile yet (sweep in flight)? Heat alone can carry.
-                    val hot = app.nogarbo.leflac.data.PlayStatsStore.hotScore(scanContext, key)
-                    // Heat carries real weight: a maxed-heat track outranks
-                    // any heuristic-only score. You trained to it; it counts.
-                    val rank = (p?.let { app.nogarbo.leflac.data.TrackProfileStore.gymScore(it) } ?: 0f) +
-                        0.75f * (hot / 6.0).coerceAtMost(1.0).toFloat()
-                    t to rank
-                }
-                .filter { it.second > 0.24f }
-                .sortedByDescending { it.second }
-                .take(40)
-                .map { it.first }
+            command == "hot" -> hotTracks
+            command == "mix" -> mixes
+            command == "rng" -> tracks.shuffled().take(10)
+            isWorkoutQuery -> workoutCatalog.take(50).map { it.track }
+            isDeckCommandPrefix && !resolvesCommand -> emptyList()
             else -> (tracks + mixes).filter {
                 it.title.contains(q, ignoreCase = true) ||
                     it.artist.contains(q, ignoreCase = true)
@@ -209,6 +298,10 @@ fun LibraryGrid(
     }
     val currentFolder by viewModel.currentFolder.collectAsState()
     val focusManager = LocalFocusManager.current
+    var searchFocused by remember { androidx.compose.runtime.mutableStateOf(false) }
+    val showTrackResultOverlay = searchFocused &&
+        commandSuggestions.isEmpty() &&
+        searchResults.isNotEmpty()
     val searchListState = androidx.compose.foundation.lazy.rememberLazyListState()
     val hotListState = androidx.compose.foundation.lazy.rememberLazyListState()
     val mixesListState = androidx.compose.foundation.lazy.rememberLazyListState()
@@ -372,51 +465,135 @@ fun LibraryGrid(
         } else {
 
         // SCAN line: terminal-style filter and command prompt
-        ScanField(
-            query = searchQuery,
-            onQueryChange = { searchQuery = it }
-        )
+        Box(modifier = Modifier.fillMaxWidth()) {
+            ScanField(
+                query = searchQuery,
+                onQueryChange = { searchQuery = it },
+                onFocusChanged = { searchFocused = it }
+            )
+            if (commandSuggestions.isNotEmpty()) {
+                DeckCommandSuggestionOverlay(
+                    suggestions = commandSuggestions,
+                    onSelect = { suggestion ->
+                        searchQuery = suggestion.command
+                        focusManager.clearFocus()
+                    }
+                )
+            } else if (showTrackResultOverlay) {
+                SearchTrackResultOverlay(
+                    resultCount = searchResults.size,
+                    label = when {
+                        isWorkoutQuery -> activeWorkoutMode.displayName
+                        command == "hot" -> "HOT"
+                        command == "mix" -> "MIXES"
+                        command == "rng" -> "RNG"
+                        else -> "SONGS + MIXES"
+                    },
+                ) {
+                    items(
+                        count = searchResults.size,
+                        key = { "search-overlay-${searchResults[it].uri}" }
+                    ) { index ->
+                        val track = searchResults[index]
+                        TrackItem(
+                            track = track,
+                            isPlaying = track.uri.toString() == playingTrackId,
+                            isHot = hotTrackIds.contains(track.uri.toString()),
+                            upNextPosition = queuedPositions[track.uri.toString()],
+                            isQueueSelected = selectedForQueue.any { it.uri == track.uri },
+                            selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
+                                .takeIf { it >= 0 }?.plus(1),
+                            selectionMode = selectionActive,
+                            workoutBadge = workoutRatings[track.uri.toString()]?.let { rating ->
+                                "${activeWorkoutMode.shortCode}${(rating.audioFit * 99f).toInt().coerceIn(0, 99).toString().padStart(2, '0')}"
+                            },
+                            queueBlockedReason = queueBlockReason(track),
+                            selectionEnabled = !selectionActive || queueBlockReason(track) == null,
+                            onLongClick = {
+                                focusManager.clearFocus()
+                                toggleQueueSelection(track)
+                            },
+                            onClick = {
+                                focusManager.clearFocus()
+                                if (selectionActive) {
+                                    toggleQueueSelection(track)
+                                } else {
+                                    if (isWorkoutQuery) onGymStart(activeWorkoutMode)
+                                    onTrackSelected(track)
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        if (isWorkoutQuery) {
+            WorkoutModeSelector(
+                active = activeWorkoutMode,
+                onSelect = { mode ->
+                    selectedWorkoutMode = mode
+                    searchQuery = ".gym"
+                }
+            )
+        }
 
         if (searchQuery.isNotBlank()) {
             // COMMAND RESULTS replace the shelves while the prompt is live
             androidx.compose.foundation.lazy.LazyColumn(
                 state = searchListState,
-                contentPadding = PaddingValues(bottom = 24.dp)
+                contentPadding = PaddingValues(bottom = 24.dp),
+                modifier = Modifier.imePadding()
             ) {
-                if (searchResults.isEmpty()) {
+                if (searchResults.isEmpty() && commandSuggestions.isEmpty()) {
                     item {
                         Text(
-                            text = "NO SIGNAL",
+                            text = if (isWorkoutQuery && workoutSnapshot.isLoading) {
+                                "LOADING ${activeWorkoutMode.displayName} PROFILE"
+                            } else if (isWorkoutQuery && unprofiledWorkoutCount > 0) {
+                                "ANALYZING TRAINING SET\n$unprofiledWorkoutCount TRACKS REMAIN"
+                            } else if (isWorkoutQuery) {
+                                "NO ${activeWorkoutMode.displayName} MATCHES"
+                            } else if (isDeckCommandPrefix && !resolvesCommand) {
+                                "NO DECK COMMAND\nTYPE . TO LIST COMMANDS"
+                            } else {
+                                "NO SIGNAL"
+                            },
                             style = FieldTypography.labelMedium,
                             color = skin.dim,
                             modifier = Modifier.padding(16.dp)
                         )
                     }
                 }
-                items(searchResults.size) { index ->
-                    val track = searchResults[index]
-                    TrackItem(
-                        track = track,
-                        isPlaying = track.uri.toString() == playingTrackId,
-                        isHot = hotTrackIds.contains(track.uri.toString()),
-                        upNextPosition = queuedPositions[track.uri.toString()],
-                        isQueueSelected = selectedForQueue.any { it.uri == track.uri },
-                        selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
-                            .takeIf { it >= 0 }?.plus(1),
-                        selectionMode = selectionActive,
-                        queueBlockedReason = queueBlockReason(track),
-                        selectionEnabled = !selectionActive || queueBlockReason(track) == null,
-                        onLongClick = { toggleQueueSelection(track) },
-                        onClick = {
-                            if (selectionActive) {
-                                toggleQueueSelection(track)
-                            } else {
-                                // Playing from the gym list starts a session
-                                if (isGymQuery) onGymStart()
-                                onTrackSelected(track)
+                if (!showTrackResultOverlay) {
+                    items(searchResults.size) { index ->
+                        val track = searchResults[index]
+                        TrackItem(
+                            track = track,
+                            isPlaying = track.uri.toString() == playingTrackId,
+                            isHot = hotTrackIds.contains(track.uri.toString()),
+                            upNextPosition = queuedPositions[track.uri.toString()],
+                            isQueueSelected = selectedForQueue.any { it.uri == track.uri },
+                            selectionPosition = selectedForQueue.indexOfFirst { it.uri == track.uri }
+                                .takeIf { it >= 0 }?.plus(1),
+                            selectionMode = selectionActive,
+                            workoutBadge = workoutRatings[track.uri.toString()]?.let { rating ->
+                                "${activeWorkoutMode.shortCode}${(rating.audioFit * 99f).toInt().coerceIn(0, 99).toString().padStart(2, '0')}"
+                            },
+                            queueBlockedReason = queueBlockReason(track),
+                            selectionEnabled = !selectionActive || queueBlockReason(track) == null,
+                            onLongClick = { toggleQueueSelection(track) },
+                            onClick = {
+                                if (selectionActive) {
+                                    toggleQueueSelection(track)
+                                } else {
+                                    // Playing from the gym list starts a session
+                                    if (isWorkoutQuery) onGymStart(activeWorkoutMode)
+                                    onTrackSelected(track)
+                                }
                             }
-                        }
-                    )
+                        )
+                    }
                 }
             }
         } else {
@@ -603,6 +780,272 @@ fun LibraryGrid(
     }
 }
 
+private object AboveScanPopupPositionProvider : androidx.compose.ui.window.PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: androidx.compose.ui.unit.IntRect,
+        windowSize: androidx.compose.ui.unit.IntSize,
+        layoutDirection: androidx.compose.ui.unit.LayoutDirection,
+        popupContentSize: androidx.compose.ui.unit.IntSize
+    ): androidx.compose.ui.unit.IntOffset {
+        val maxX = (windowSize.width - popupContentSize.width).coerceAtLeast(0)
+        return androidx.compose.ui.unit.IntOffset(
+            x = anchorBounds.left.coerceIn(0, maxX),
+            y = (anchorBounds.top - popupContentSize.height).coerceAtLeast(0)
+        )
+    }
+}
+
+@Composable
+private fun DeckCommandSuggestionOverlay(
+    suggestions: List<DeckCommandSuggestion>,
+    onSelect: (DeckCommandSuggestion) -> Unit
+) {
+    val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
+    val visibleRows = suggestions.size.coerceAtMost(5)
+    val outline = if (skin.isLcd) skin.accent else skin.dim.copy(alpha = 0.45f)
+    androidx.compose.ui.window.Popup(
+        popupPositionProvider = AboveScanPopupPositionProvider,
+        onDismissRequest = {},
+        properties = androidx.compose.ui.window.PopupProperties(
+            focusable = false,
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+            clippingEnabled = true
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 68.dp, end = 64.dp)
+                .height((32 + visibleRows * 48).dp)
+                .background(androidx.compose.material3.MaterialTheme.colorScheme.background)
+                .border(1.dp, outline)
+                .drawBehind {
+                    drawLine(
+                        color = skin.accent,
+                        start = androidx.compose.ui.geometry.Offset.Zero,
+                        end = androidx.compose.ui.geometry.Offset(size.width, 0f),
+                        strokeWidth = 3f
+                    )
+                }
+                .semantics {
+                    liveRegion = LiveRegionMode.Polite
+                    stateDescription = "${suggestions.size} deck command suggestions above search"
+                }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp)
+                    .drawBehind {
+                        drawLine(
+                            color = if (skin.isLcd) skin.shadeMid else skin.dim.copy(alpha = 0.28f),
+                            start = androidx.compose.ui.geometry.Offset(0f, size.height - 0.5f),
+                            end = androidx.compose.ui.geometry.Offset(size.width, size.height - 0.5f),
+                            strokeWidth = 1f
+                        )
+                    }
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SCAN · COMMANDS",
+                    style = FieldTypography.labelSmall,
+                    color = skin.accent,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "${suggestions.size.toString().padStart(2, '0')} AVAILABLE",
+                    style = FieldTypography.labelSmall,
+                    color = skin.dim
+                )
+            }
+            androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.weight(1f)) {
+                items(
+                    count = suggestions.size,
+                    key = { "deck-command-${suggestions[it].command}" }
+                ) { index ->
+                    val suggestion = suggestions[index]
+                    DeckCommandSuggestionRow(
+                        suggestion = suggestion,
+                        onSelect = { onSelect(suggestion) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SearchTrackResultOverlay(
+    resultCount: Int,
+    label: String,
+    content: androidx.compose.foundation.lazy.LazyListScope.() -> Unit
+) {
+    val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
+    val visibleRows = resultCount.coerceAtMost(5)
+    val outline = if (skin.isLcd) skin.accent else skin.dim.copy(alpha = 0.45f)
+    androidx.compose.ui.window.Popup(
+        popupPositionProvider = AboveScanPopupPositionProvider,
+        onDismissRequest = {},
+        properties = androidx.compose.ui.window.PopupProperties(
+            focusable = false,
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+            clippingEnabled = true
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 68.dp, end = 64.dp)
+                .height((32 + visibleRows * 64).dp)
+                .background(androidx.compose.material3.MaterialTheme.colorScheme.background)
+                .border(1.dp, outline)
+                .drawBehind {
+                    drawLine(
+                        color = skin.accent,
+                        start = androidx.compose.ui.geometry.Offset.Zero,
+                        end = androidx.compose.ui.geometry.Offset(size.width, 0f),
+                        strokeWidth = 3f
+                    )
+                }
+                .semantics {
+                    liveRegion = LiveRegionMode.Polite
+                    stateDescription = "$resultCount search results above search"
+                }
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(32.dp)
+                    .drawBehind {
+                        drawLine(
+                            color = if (skin.isLcd) skin.shadeMid else skin.dim.copy(alpha = 0.28f),
+                            start = androidx.compose.ui.geometry.Offset(0f, size.height - 0.5f),
+                            end = androidx.compose.ui.geometry.Offset(size.width, size.height - 0.5f),
+                            strokeWidth = 1f
+                        )
+                    }
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "SCAN · $label",
+                    style = FieldTypography.labelSmall,
+                    color = skin.accent,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1
+                )
+                Text(
+                    text = "${resultCount.toString().padStart(2, '0')} MATCHES",
+                    style = FieldTypography.labelSmall,
+                    color = skin.dim,
+                    maxLines = 1
+                )
+            }
+            androidx.compose.foundation.lazy.LazyColumn(
+                modifier = Modifier.weight(1f),
+                content = content
+            )
+        }
+    }
+}
+
+@Composable
+private fun DeckCommandSuggestionRow(
+    suggestion: DeckCommandSuggestion,
+    onSelect: () -> Unit
+) {
+    val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clickable(
+                role = Role.Button,
+                onClickLabel = "Run ${suggestion.command} command",
+                onClick = onSelect
+            )
+            .semantics {
+                contentDescription = "${suggestion.command}, ${suggestion.description.lowercase()}"
+            }
+            .drawBehind {
+                drawLine(
+                    color = if (skin.isLcd) skin.shadeMid else skin.dim.copy(alpha = 0.28f),
+                    start = androidx.compose.ui.geometry.Offset(0f, size.height - 0.5f),
+                    end = androidx.compose.ui.geometry.Offset(size.width, size.height - 0.5f),
+                    strokeWidth = 1f
+                )
+            }
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = suggestion.command,
+            style = FieldTypography.bodyMedium,
+            color = skin.accent,
+            modifier = Modifier.width(96.dp),
+            maxLines = 1
+        )
+        Text(
+            text = suggestion.description,
+            style = FieldTypography.labelSmall,
+            color = skin.dim,
+            maxLines = 1,
+            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun WorkoutModeSelector(
+    active: WorkoutMode,
+    onSelect: (WorkoutMode) -> Unit
+) {
+    val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
+    val selectedBackground: androidx.compose.ui.graphics.Brush =
+        if (skin.isLcd) app.nogarbo.leflac.ui.components.rememberDitherBrush(skin.accent, 0.25f)
+        else androidx.compose.ui.graphics.SolidColor(skin.accent.copy(alpha = 0.10f))
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(40.dp)
+            .border(1.dp, skin.dim)
+            .selectableGroup()
+    ) {
+        WorkoutMode.entries.forEachIndexed { index, mode ->
+            val selected = mode == active
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .then(if (selected) Modifier.background(selectedBackground) else Modifier)
+                    .selectable(
+                        selected = selected,
+                        role = Role.Tab,
+                        onClick = { onSelect(mode) }
+                    )
+                    .semantics {
+                        contentDescription = "${mode.displayName.lowercase().replaceFirstChar(Char::uppercase)} workout profile"
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = mode.displayName,
+                    style = FieldTypography.labelSmall.copy(fontSize = 9.sp),
+                    color = if (selected) skin.accent else skin.dim,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1
+                )
+            }
+            if (index < WorkoutMode.entries.lastIndex) {
+                Box(Modifier.width(1.dp).fillMaxHeight().background(skin.dim))
+            }
+        }
+    }
+}
+
 @Composable
 private fun QueueSelectionBar(
     count: Int,
@@ -731,6 +1174,7 @@ private fun UpNextPanel(
     onClear: () -> Unit
 ) {
     val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
+    val manualCount = entries.count { it.origin == QueueEntryOrigin.MANUAL }
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
@@ -748,28 +1192,31 @@ private fun UpNextPanel(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "UP NEXT // ${compactQueueCount(entries.size)}",
+                text = buildString {
+                    append("UP NEXT // ${compactQueueCount(entries.size)}")
+                    if (manualCount > 0) append(" · ${compactQueueCount(manualCount)} HELD")
+                },
                 style = FieldTypography.labelMedium,
                 color = skin.accent,
                 modifier = Modifier.weight(1f)
             )
-            if (entries.isNotEmpty()) {
+            if (manualCount > 0) {
                 Box(
                     modifier = Modifier
-                        .width(72.dp)
+                        .width(88.dp)
                         .fillMaxHeight()
                         .clickable(
                             role = Role.Button,
-                            onClickLabel = "Clear Up Next",
+                            onClickLabel = "Clear held Up Next tracks",
                             onClick = onClear
                         )
                         .semantics {
                             contentDescription =
-                                "Clear ${entries.size} Up Next ${if (entries.size == 1) "track" else "tracks"}"
+                                "Clear $manualCount held Up Next ${if (manualCount == 1) "track" else "tracks"}; keep generated rail"
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("[CLEAR]", style = FieldTypography.labelSmall, color = skin.accent)
+                    Text("[CLR HELD]", style = FieldTypography.labelSmall, color = skin.accent)
                 }
             }
         }
@@ -777,7 +1224,7 @@ private fun UpNextPanel(
         if (entries.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    text = "UP NEXT EMPTY\n[HOLD A TRACK TO LOAD]",
+                    text = "QUEUE EMPTY\n[PLAY A TRACK OR HOLD TO LOAD]",
                     style = FieldTypography.labelMedium,
                     color = skin.dim,
                     textAlign = TextAlign.Center
@@ -810,6 +1257,7 @@ private fun UpNextPanel(
                                     }
                                     contentDescription =
                                         "Up Next ${index + 1} of ${entries.size}, " +
+                                        "${if (entry.origin == QueueEntryOrigin.MANUAL) "held" else "generated rail"}, " +
                                         "${entry.title}, ${entry.artist}$durationLabel"
                                     if (index == 0) stateDescription = "Plays next"
                                 },
@@ -830,7 +1278,11 @@ private fun UpNextPanel(
                                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = entry.artist.uppercase(),
+                                    text = buildString {
+                                        append(if (entry.origin == QueueEntryOrigin.MANUAL) "HELD" else "RAIL")
+                                        append(" · ")
+                                        append(entry.artist.uppercase())
+                                    },
                                     style = FieldTypography.labelSmall,
                                     color = skin.dim,
                                     maxLines = 1,
@@ -933,6 +1385,7 @@ fun TrackItem(
     isQueueSelected: Boolean = false,
     selectionPosition: Int? = null,
     selectionMode: Boolean = false,
+    workoutBadge: String? = null,
     queueBlockedReason: String? = null,
     selectionEnabled: Boolean = true,
     onLongClick: () -> Unit = {},
@@ -942,6 +1395,7 @@ fun TrackItem(
     // Tap the tech badge to flip the row into service mode (play stats)
     var serviceMode by remember(track.uri) { androidx.compose.runtime.mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
+    val profileRevision by app.nogarbo.leflac.data.TrackProfileStore.revision.collectAsState()
     // LCD has no alpha: the playing highlight becomes a Bayer dither field.
     val playingBg: androidx.compose.ui.graphics.Brush =
         if (skin.isLcd) app.nogarbo.leflac.ui.components.rememberDitherBrush(skin.accent, 0.25f)
@@ -955,6 +1409,7 @@ fun TrackItem(
     val rowState = buildList {
         if (isPlaying) add("Currently playing")
         if (isHot) add("Hot now")
+        if (workoutBadge != null) add("Workout rating $workoutBadge")
         when {
             isQueueSelected -> add("Selected for Up Next position $selectionPosition")
             upNextPosition != null -> add("Up Next position $upNextPosition")
@@ -1038,7 +1493,7 @@ fun TrackItem(
                     app.nogarbo.leflac.data.PlayStatsStore.get(context, track.uri.toString())
                 }
                 val heat = app.nogarbo.leflac.data.PlayStatsStore.hotScore(stats)
-                val profile = remember(serviceMode) {
+                val profile = remember(serviceMode, profileRevision) {
                     app.nogarbo.leflac.data.TrackProfileStore.get(context, track.uri.toString())
                 }
                 val daysAgo = if (stats.t > 0) (System.currentTimeMillis() - stats.t) / 86_400_000L else -1L
@@ -1123,21 +1578,30 @@ fun TrackItem(
                     )
                 }
                 // Gym rating: barbell opacity carries the score
-                val gymRating = remember(track.uri) {
+                val gymRating = remember(track.uri, profileRevision) {
                     app.nogarbo.leflac.data.TrackProfileStore.get(context, track.uri.toString())
                         ?.let { app.nogarbo.leflac.data.TrackProfileStore.gymScore(it) } ?: 0f
                 }
-                if (gymRating > 0.24f) {
+                if (gymRating >= 0.48f) {
                     Spacer(modifier = Modifier.width(4.dp))
                     app.nogarbo.leflac.ui.components.BarbellIcon(
                         modifier = Modifier.size(12.dp),
                         // LCD has no alpha: a weak score uses the mid shade instead
                         color = if (skin.isLcd) {
-                            if (gymRating >= 0.40f) skin.accent else skin.shadeMid
-                        } else skin.rng.copy(alpha = (gymRating / 0.40f).coerceIn(0.35f, 1f))
+                            if (gymRating >= 0.65f) skin.accent else skin.shadeMid
+                        } else skin.rng.copy(alpha = (gymRating / 0.70f).coerceIn(0.35f, 1f))
                     )
                 }
                 Spacer(modifier = Modifier.width(8.dp))
+                if (workoutBadge != null) {
+                    Text(
+                        text = workoutBadge,
+                        style = FieldTypography.labelSmall,
+                        color = skin.rng,
+                        maxLines = 1
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                }
                 if (queueMarker != null) {
                     Text(
                         text = queueMarker,
@@ -1180,7 +1644,11 @@ fun formatDuration(millis: Long): String {
 }
 
 @Composable
-fun ScanField(query: String, onQueryChange: (String) -> Unit) {
+fun ScanField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onFocusChanged: (Boolean) -> Unit = {}
+) {
     val skin = app.nogarbo.leflac.ui.skins.LocalFieldSkin.current
     val ink = androidx.compose.material3.MaterialTheme.colorScheme.onBackground
     Row(
@@ -1202,9 +1670,29 @@ fun ScanField(query: String, onQueryChange: (String) -> Unit) {
             singleLine = true,
             textStyle = FieldTypography.labelMedium.copy(color = ink),
             cursorBrush = androidx.compose.ui.graphics.SolidColor(skin.accent),
+            decorationBox = { innerTextField ->
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    if (query.isEmpty()) {
+                        Text(
+                            text = "TYPE . FOR COMMANDS",
+                            style = FieldTypography.labelSmall,
+                            color = skin.dim
+                        )
+                    }
+                    innerTextField()
+                }
+            },
             modifier = Modifier
                 .weight(1f)
-                .semantics { contentDescription = "Search songs and mixes" }
+                .then(
+                    Modifier.onFocusChanged { state ->
+                        onFocusChanged(state.isFocused)
+                    }
+                )
+                .semantics {
+                    contentDescription =
+                        "Search songs and mixes; type dot for deck commands"
+                }
                 .border(1.dp, if (query.isBlank()) skin.dim else skin.accent)
                 .padding(horizontal = 8.dp, vertical = 6.dp)
         )

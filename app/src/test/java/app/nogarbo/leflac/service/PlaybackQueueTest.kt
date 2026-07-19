@@ -25,6 +25,54 @@ class PlaybackQueueTest {
     }
 
     @Test
+    fun effectiveFutureIncludesManualAndGeneratedButHidesPromotedOccurrence() {
+        assertEquals(
+            listOf(2, 3, 5),
+            effectiveFutureIndices(
+                currentIndex = 1,
+                timelineIds = listOf("history", "current", "manual-a", "rail-x", "manual-a", "rail-y"),
+                marked = listOf(false, false, true, false, false, false)
+            )
+        )
+    }
+
+    @Test
+    fun effectiveFutureHidesExactlyOneNaturalOccurrencePerPromotion() {
+        assertEquals(
+            listOf(1, 2, 5),
+            effectiveFutureIndices(
+                currentIndex = 0,
+                timelineIds = listOf("current", "repeat", "repeat", "repeat", "repeat", "repeat"),
+                marked = listOf(false, true, true, false, false, false)
+            )
+        )
+    }
+
+    @Test
+    fun effectiveFutureDoesNotLetHistoryOrCurrentPromotionsHideFutureRepeats() {
+        assertEquals(
+            listOf(2, 3, 4),
+            effectiveFutureIndices(
+                currentIndex = 1,
+                timelineIds = listOf("repeat", "repeat", "repeat", "rail", "repeat"),
+                marked = listOf(true, true, false, false, false)
+            )
+        )
+    }
+
+    @Test
+    fun effectiveFutureWithoutCurrentProjectsWholeTimeline() {
+        assertEquals(
+            listOf(0, 2),
+            effectiveFutureIndices(
+                currentIndex = C.INDEX_UNSET,
+                timelineIds = listOf("manual-a", "manual-a", "rail"),
+                marked = listOf(true, false, false)
+            )
+        )
+    }
+
+    @Test
     fun priorityItemsPrecedeRailWithoutDestroyingNaturalOccurrences() {
         val merged = insertPriorityAfterCurrent(
             base = listOf("history", "current", "a", "rail", "b", "a"),

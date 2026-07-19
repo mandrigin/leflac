@@ -1,10 +1,11 @@
 # LE FLAC UP NEXT Operator Guide
 
-UP NEXT is LF-1's explicit priority bus. It sits inside the same Media3 player
-timeline as ORDER, RNG, the notification, and projected Android Auto:
+UP NEXT is LF-1's effective-future ledger. Its `HELD` rows form the explicit
+priority bus, and its `RAIL` rows expose the generated future from the same
+Media3 timeline used by ORDER, RNG, the notification, and projected Android Auto:
 
 ```text
-HISTORY | CURRENT | UP NEXT 01 | UP NEXT 02 | ORDER/RNG FUTURE
+HISTORY | CURRENT | HELD 01 | HELD 02 | ORDER/RNG RAIL
 ```
 
 ## Load one or several tracks
@@ -22,16 +23,21 @@ when ready.
 
 ## Inspect and edit
 
-Open the fourth ledger tab, `NEXT nn`.
+Open the fourth ledger tab, `NEXT nn`. It is pre-filled from the real Media3
+timeline, even when you have not held any tracks yourself.
 
-- The number is the pending item count.
-- Rows are numbered in exact FIFO order.
-- `[X]` removes one item without changing the current track or position.
-- `[CLEAR]` removes the explicit future and leaves the active rail intact.
+- The number is the complete effective-future count.
+- `HELD` rows are explicit priority picks; `RAIL` rows come from ORDER/RNG.
+- Rows are numbered in exact playback order and intentional repeats remain
+  distinct occurrences.
+- `[X]` removes that exact occurrence without changing the current track or
+  position.
+- `[CLR HELD]` removes explicit picks and leaves the active rail intact.
 
-Scheduling a track already pending is an idempotent no-op. Until playback, the
-underlying rail stays intact so remove/clear are lossless. Once a marked item is
-consumed, LF-1 removes its first later natural repeat so it does not play twice.
+Scheduling a track already HELD is an idempotent no-op. Promotion leaves the
+underlying rail intact so removing/clearing HELD items is lossless. The UI hides
+the promoted track's temporary natural rail copy because LF-1 removes that copy
+when the HELD occurrence is consumed; later intentional RNG repeats stay shown.
 
 ## Rail and transport rules
 

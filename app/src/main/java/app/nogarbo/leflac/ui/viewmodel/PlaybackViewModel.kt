@@ -54,29 +54,89 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     private val _currentMediaId = MutableStateFlow<String?>(null)
     val currentMediaId = _currentMediaId.asStateFlow()
 
-    /** Service-fed view of the marked priority segment in the real timeline. */
+    /** Service-fed effective future: held priority items plus ORDER/RNG rail. */
     val upNext = app.nogarbo.leflac.service.PlaybackBus.upNext.asStateFlow()
 
-    // GYM SESSION: queue stays inside the gym pool until manually ended
-    private val _gymMode = MutableStateFlow(false)
-    val gymMode = _gymMode.asStateFlow()
-    fun setGymMode(on: Boolean) { _gymMode.value = on }
+    // WORKOUT SESSION: the generated rail stays inside one qualified mode.
+    private val _workoutMode = MutableStateFlow<app.nogarbo.leflac.data.WorkoutMode?>(null)
+    val workoutMode = _workoutMode.asStateFlow()
+    private var workoutLibraryTracks: List<app.nogarbo.leflac.data.AudioTrack> = emptyList()
+    private var playSelectionJob: kotlinx.coroutines.Job? = null
+    val gymMode = _workoutMode
+        .map { it != null }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    fun startWorkout(mode: app.nogarbo.leflac.data.WorkoutMode) {
+        _workoutMode.value = mode
+    }
+
+    fun setGymMode(on: Boolean) {
+        if (!on) {
+            _workoutMode.value = null
+            val current = workoutLibraryTracks.firstOrNull {
+                it.uri.toString() == _currentMediaId.value
+            }
+            if (current != null) {
+                val playlist = if (_isShuffleEnabled.value) {
+                    generateSmartQueue(workoutLibraryTracks, current)
+                } else {
+                    playbackPool(workoutLibraryTracks, current)
+                }
+                updateQueueInternal(playlist, playlist.indexOf(current).coerceAtLeast(0))
+            }
+        } else if (_workoutMode.value == null) {
+            _workoutMode.value = app.nogarbo.leflac.data.WorkoutMode.WEIGHTS
+        }
+    }
     
     // Alias kept for call-site stability; the bus itself now lives with
     // playback (see service/PlaybackBus) and is fed by AudioService.
     object VisualizerBus {
         val spectrum get() = app.nogarbo.leflac.service.PlaybackBus.spectrum
         val mixProgress get() = app.nogarbo.leflac.service.PlaybackBus.mixProgress
+        val mixHeat get() = app.nogarbo.leflac.service.PlaybackBus.mixHeat
         val isPlaying get() = app.nogarbo.leflac.service.PlaybackBus.isPlaying
     }
     
     val spectrum = VisualizerBus.spectrum.asStateFlow()
+    val mixHeat = VisualizerBus.mixHeat.asStateFlow()
 
     private var mediaController: MediaController? = null
 
     init {
         initializeController()
         startPositionUpdater()
+        observeWorkoutProfileUpdates()
+    }
+
+    private fun observeWorkoutProfileUpdates() {
+        viewModelScope.launch {
+            app.nogarbo.leflac.data.TrackProfileStore.revision
+                .drop(1)
+                .conflate()
+                .collect {
+                    val requestedMode = _workoutMode.value ?: return@collect
+                    val requestedTracks = workoutLibraryTracks
+                    if (requestedTracks.isEmpty()) return@collect
+                    val requestedMediaId = _currentMediaId.value ?: return@collect
+                    val current = requestedTracks.firstOrNull {
+                        it.uri.toString() == requestedMediaId
+                    } ?: return@collect
+                    if (isMixTrack(current)) return@collect
+                    val refreshed = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        generateSmartQueue(requestedTracks, current)
+                    }
+                    if (_workoutMode.value == requestedMode &&
+                        _currentMediaId.value == requestedMediaId
+                    ) {
+                        refreshWorkoutFuture(refreshed)
+                    }
+                    // New profiles join a live session promptly, but a large
+                    // upgrade sweep cannot trigger a full-library rebuild for
+                    // every individual track.
+                    delay(10_000L)
+                }
+        }
     }
 
     private fun initializeController() {
@@ -135,6 +195,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
                     _duration.value = player.duration.coerceAtLeast(0)
+                    analysisTimeline?.let(::updateTimelineFromFrames)
                 }
             }
 
@@ -146,6 +207,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                 _currentMediaId.value = mediaItem?.mediaId
                 _duration.value = player.duration.coerceAtLeast(0)
                 _spectralHistory.value = emptyList() // Reset history for new track
+                _cuePoints.value = emptyList()
                 
                 // Trigger Analysis
                 mediaItem?.localConfiguration?.uri?.let { uri -> analyzeTrack(uri) }
@@ -280,10 +342,29 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         }
         _fullTimeline.value = points
 
-        // Mixes: extract cue points (track transitions) from novelty peaks
-        _cuePoints.value = if (frames.last().timestampMs >= MIX_DURATION_THRESHOLD_MS) {
+        // Mixes: publish/install only a near-final cue map. Partial analysis
+        // otherwise changes the top peaks repeatedly and corrupts segment stats.
+        val playerDurationMs = _duration.value
+        val cueMapReady = app.nogarbo.leflac.data.isMixCueMapReady(
+            durationMs = playerDurationMs,
+            mixDurationThresholdMs = MIX_DURATION_THRESHOLD_MS,
+            analysisProgress = _analysisProgress.value
+        )
+        val cueMap = if (cueMapReady) {
             extractCuePoints(frames)
-        } else emptyList()
+        } else {
+            emptyList()
+        }
+        _cuePoints.value = cueMap
+        // An empty *final* map is meaningful; an empty partial map is not.
+        // Installing the latter would collapse provisional 30-second listening
+        // buckets into one whole-mix segment before real cues are available.
+        if (cueMapReady) {
+            _currentMediaId.value?.let { mediaId ->
+                app.nogarbo.leflac.service.AudioService.instance
+                    ?.installMixCueMap(mediaId, playerDurationMs, cueMap)
+            }
+        }
     }
 
     /**
@@ -306,7 +387,20 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
                 maxOf(b.cymbals - a.cymbals, 0f) + maxOf(b.vocal - a.vocal, 0f) +
                 maxOf(b.synth - a.synth, 0f) + maxOf(b.bassGuitar - a.bassGuitar, 0f)
         }
-        val candidates = (1 until n).sortedByDescending { novelty[it] }
+        val sortedNovelty = novelty.clone().also(FloatArray::sort)
+        val median = sortedNovelty[sortedNovelty.size / 2]
+        val deviations = FloatArray(n) { kotlin.math.abs(novelty[it] - median) }
+            .also(FloatArray::sort)
+        val mad = deviations[deviations.size / 2]
+        val p90 = sortedNovelty[(sortedNovelty.lastIndex * 0.90f).toInt()]
+        val threshold = maxOf(0.12f, median + 3f * mad, p90 * 0.75f)
+        val candidates = (2 until n - 1)
+            .filter { index ->
+                novelty[index] >= threshold &&
+                    novelty[index] > novelty[index - 1] &&
+                    novelty[index] >= novelty[index + 1]
+            }
+            .sortedByDescending { novelty[it] }
         val chosen = mutableListOf<Long>()
         for (idx in candidates) {
             if (chosen.size >= maxCues) break
@@ -455,6 +549,48 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
     private fun isMixTrack(track: app.nogarbo.leflac.data.AudioTrack): Boolean =
         track.duration >= MIX_DURATION_THRESHOLD_MS
 
+    /** Build potentially large smart/workout rails off-main, latest tap wins. */
+    fun playTrackFromLibrary(
+        libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>,
+        track: app.nogarbo.leflac.data.AudioTrack
+    ) {
+        playSelectionJob?.cancel()
+        val requestedWorkoutMode = _workoutMode.value
+        val requestedShuffle = _isShuffleEnabled.value
+        playSelectionJob = viewModelScope.launch {
+            val playlist = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                if (requestedShuffle || requestedWorkoutMode != null) {
+                    generateSmartQueue(libraryTracks, track)
+                } else {
+                    playbackPool(libraryTracks, track)
+                }
+            }
+            if (playlist.isEmpty()) return@launch
+            val startIndex = if (requestedShuffle || requestedWorkoutMode != null) {
+                0
+            } else {
+                playlist.indexOf(track).coerceAtLeast(0)
+            }
+            val intent = android.content.Intent(
+                getApplication<Application>(),
+                AudioService::class.java
+            ).apply {
+                action = app.nogarbo.leflac.service.AudioCommandBus.ACTION_PLAY_LIST
+                putParcelableArrayListExtra(
+                    "URIS",
+                    ArrayList<android.os.Parcelable>(playlist.map { it.uri })
+                )
+                putStringArrayListExtra("TITLES", ArrayList(playlist.map { it.title }))
+                putStringArrayListExtra("ARTISTS", ArrayList(playlist.map { it.artist }))
+                putExtra("DURATIONS", playlist.map { it.duration }.toLongArray())
+                putExtra("START_INDEX", startIndex)
+            }
+            getApplication<Application>().startForegroundService(
+                app.nogarbo.leflac.service.AudioCommandBus.authorize(intent)
+            )
+        }
+    }
+
     fun generateSmartQueue(libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>, startTrack: app.nogarbo.leflac.data.AudioTrack): List<app.nogarbo.leflac.data.AudioTrack> {
         // Shuffle pools never cross: a mix start shuffles among mixes only,
         // a song start shuffles among songs only.
@@ -464,28 +600,56 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         val now = System.currentTimeMillis()
         val ctx = getApplication<Application>()
 
-        // GYM SESSION: the pool is the gym set, weighted by drive
-        val gymOn = _gymMode.value && !startIsMix
-        val pool2 = if (gymOn) {
-            val g = pool.filter { t ->
-                val key = t.uri.toString()
-                val pr = app.nogarbo.leflac.data.TrackProfileStore.get(ctx, key)
-                val byDrive = (pr?.let { app.nogarbo.leflac.data.TrackProfileStore.gymScore(it) } ?: 0f) > 0.24f
-                val byHeat = app.nogarbo.leflac.data.PlayStatsStore.hotScore(ctx, key, now) > 3.0
-                byDrive || byHeat
+        val activeWorkout = _workoutMode.value.takeIf { it != null && !startIsMix }
+        if (activeWorkout != null) {
+            workoutLibraryTracks = libraryTracks
+            val qualified = app.nogarbo.leflac.data.workoutCandidates(
+                context = ctx,
+                tracks = pool,
+                mode = activeWorkout,
+                now = now
+            ).map { it.track }
+
+            // The visible catalog and playback share exactly this qualified
+            // set. Never inflate a small workout set with arbitrary songs.
+            val remaining = qualified
+                .filterNot { it.uri == startTrack.uri }
+                .toMutableList()
+            val cycle = mutableListOf(startTrack)
+            while (remaining.isNotEmpty()) {
+                val previousArtist = cycle.lastOrNull()?.artist
+                val nextIndex = remaining.indexOfFirst { candidate ->
+                    previousArtist.isNullOrBlank() ||
+                        !candidate.artist.equals(previousArtist, ignoreCase = true)
+                }.takeIf { it >= 0 } ?: 0
+                cycle += remaining.removeAt(nextIndex)
             }
-            if (g.size >= 10) (g + startTrack).distinct() else pool
-        } else pool
+
+            // Materialize enough qualified cycles for a long session. The
+            // queue remains finite and inspectable, but a one-song catalog no
+            // longer stops after one play while the v4 profile sweep runs.
+            val session = mutableListOf<app.nogarbo.leflac.data.AudioTrack>()
+            var sessionDurationMs = 0L
+            val targetDurationMs = 6L * 60L * 60L * 1_000L
+            while (session.size < 200 &&
+                (session.isEmpty() || sessionDurationMs < targetDurationMs)
+            ) {
+                for (track in cycle) {
+                    if (session.size >= 200) break
+                    session += track
+                    sessionDurationMs += track.duration.coerceAtLeast(60_000L)
+                }
+            }
+            return session
+        }
+
+        val pool2 = pool
 
         // Favorites are ranked by recency-decayed hot score (plays minus
         // skips, halving every ~45 days) — or by gym drive in a session.
         val trackStats = pool2.map { track ->
             val hot = app.nogarbo.leflac.data.PlayStatsStore.hotScore(ctx, track.uri.toString(), now)
-            val score = if (gymOn) {
-                val pr = app.nogarbo.leflac.data.TrackProfileStore.get(ctx, track.uri.toString())
-                (pr?.let { app.nogarbo.leflac.data.TrackProfileStore.gymScore(it) } ?: 0f) +
-                    0.75 * (hot / 6.0).coerceAtMost(1.0)
-            } else hot
+            val score = hot
             track to score.toDouble()
         }
 
@@ -552,7 +716,7 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         val currentTrackId = _currentMediaId.value
         val currentTrack = libraryTracks.find { it.uri.toString() == currentTrackId } ?: libraryTracks.firstOrNull() ?: return
         
-        if (isRng) {
+        if (isRng || _workoutMode.value != null) {
             // Pool selection (mixes vs songs) happens inside generateSmartQueue.
             val playlist = generateSmartQueue(libraryTracks, currentTrack)
             updateQueueInternal(playlist, 0)
@@ -634,8 +798,9 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     fun removeFromUpNext(entryId: String) {
         val controller = mediaController ?: return
-        val index = UpNextQueue.pendingIndices(controller).firstOrNull { itemIndex ->
-            UpNextQueue.entryId(controller.getMediaItemAt(itemIndex)) == entryId
+        val start = (controller.currentMediaItemIndex + 1).coerceAtLeast(0)
+        val index = (start until controller.mediaItemCount).firstOrNull { itemIndex ->
+            UpNextQueue.occurrenceId(controller.getMediaItemAt(itemIndex), itemIndex) == entryId
         } ?: return
         controller.removeMediaItem(index)
     }
@@ -645,6 +810,31 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
         UpNextQueue.pendingIndices(controller)
             .sortedDescending()
             .forEach(controller::removeMediaItem)
+    }
+
+    /** Refresh only the qualified workout future; played history stays navigable. */
+    private fun refreshWorkoutFuture(
+        playlist: List<app.nogarbo.leflac.data.AudioTrack>
+    ) {
+        val controller = mediaController ?: return
+        val currentIndex = controller.currentMediaItemIndex
+        val current = controller.currentMediaItem ?: return
+        if (currentIndex !in 0 until controller.mediaItemCount ||
+            playlist.firstOrNull()?.uri?.toString() != current.mediaId
+        ) return
+
+        val generated = playlist.map { it.toPlaybackMediaItem() }
+        val rebuilt = insertPriorityAfterCurrent(
+            base = generated,
+            currentIndex = 0,
+            priority = UpNextQueue.pendingItems(controller)
+        )
+        if (controller.mediaItemCount > currentIndex + 1) {
+            controller.removeMediaItems(currentIndex + 1, controller.mediaItemCount)
+        }
+        if (rebuilt.size > 1) {
+            controller.addMediaItems(currentIndex + 1, rebuilt.drop(1))
+        }
     }
 
     private fun updateQueueInternal(playlist: List<app.nogarbo.leflac.data.AudioTrack>, startIndex: Int) {
@@ -738,6 +928,18 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             controller.seekToNextMediaItem()
             return
         }
+        if (_workoutMode.value != null) {
+            if (controller.hasNextMediaItem()) {
+                controller.seekToNextMediaItem()
+            } else {
+                val current = libraryTracks.firstOrNull {
+                    it.uri.toString() == _currentMediaId.value
+                } ?: return
+                updateQueueInternal(generateSmartQueue(libraryTracks, current), 0)
+                if (controller.hasNextMediaItem()) controller.seekToNextMediaItem()
+            }
+            return
+        }
         val currentTrackId = _currentMediaId.value
         val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == currentTrackId }
             ?: libraryTracks.firstOrNull()
@@ -774,6 +976,17 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
 
     fun playPreviousSequentialFile(libraryTracks: List<app.nogarbo.leflac.data.AudioTrack>) {
         val controller = mediaController ?: return
+        if (_workoutMode.value != null) {
+            if (controller.hasPreviousMediaItem()) {
+                controller.seekToPreviousMediaItem()
+            } else {
+                // At the head of a rebuilt workout rail there is no qualified
+                // physical history. Restart the current track; never fall
+                // through to the ordinary all-song pool.
+                controller.seekTo(0L)
+            }
+            return
+        }
         val currentTrackId = _currentMediaId.value
         val currentTrack = libraryTracks.firstOrNull { it.uri.toString() == currentTrackId }
             ?: libraryTracks.firstOrNull()
@@ -799,6 +1012,26 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             UpNextQueue.isMarked(controller.getMediaItemAt(immediateNext))
         ) {
             controller.seekToNextMediaItem()
+        } else if (_workoutMode.value != null) {
+            val mode = _workoutMode.value ?: return
+            val currentId = _currentMediaId.value
+            val candidate = app.nogarbo.leflac.data.workoutCandidates(
+                context = getApplication<Application>(),
+                tracks = libraryTracks.filterNot(::isMixTrack),
+                mode = mode
+            ).map { it.track }
+                .filterNot { it.uri.toString() == currentId }
+                .randomOrNull() ?: return
+            val timelineIndex = (controller.currentMediaItemIndex + 1 until controller.mediaItemCount)
+                .firstOrNull { index ->
+                    !UpNextQueue.isMarked(controller.getMediaItemAt(index)) &&
+                        controller.getMediaItemAt(index).mediaId == candidate.uri.toString()
+                }
+            if (timelineIndex != null) {
+                controller.seekTo(timelineIndex, 0L)
+            } else {
+                updateQueueInternal(generateSmartQueue(libraryTracks, candidate), 0)
+            }
         } else if (_isShuffleEnabled.value) {
             if (controller.hasNextMediaItem()) {
                 controller.seekToNextMediaItem()
@@ -823,6 +1056,8 @@ class PlaybackViewModel(application: Application) : AndroidViewModel(application
             }
             if (timelineIndex != null) {
                 controller.seekTo(timelineIndex, 0L)
+            } else if (_workoutMode.value != null) {
+                updateQueueInternal(generateSmartQueue(libraryTracks, nextRandomTrack), 0)
             } else {
                 val pool = playbackPool(libraryTracks, nextRandomTrack)
                 updateQueueInternal(pool, pool.indexOf(nextRandomTrack).coerceAtLeast(0))

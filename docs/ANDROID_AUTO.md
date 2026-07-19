@@ -1,6 +1,6 @@
 # LE FLAC Android Auto Operator Guide
 
-This guide covers LF-1 1.3.0 on projected Android Auto, with the first live
+This guide covers LF-1 1.4.0 on projected Android Auto, with live
 acceptance run targeted at a Honda e. LE FLAC remains offline-only: the car
 browser reads the phone's MediaStore and the app still declares no `INTERNET`
 permission.
@@ -20,7 +20,8 @@ used by the phone UI. The car can start the service without starting
 
 Songs and mixes keep separate queues. A song selection queues songs; a mix
 selection queues mixes. Android Auto never autoplays merely because it connects.
-Tracks scheduled with the phone's long-press UP NEXT loader occupy the priority
+The phone's NEXT ledger shows this complete shared future, while tracks
+scheduled with its long-press loader occupy the priority
 segment immediately after the current item. Natural completion and car NEXT
 consume that FIFO segment before returning to the selected ORDER/RNG rail. The
 host may expose it through its standard queue page; LE FLAC does not duplicate
@@ -57,7 +58,7 @@ The checked-in build uses:
 
 | Component | Version |
 |---|---:|
-| App | 1.3.0 (version code 4) |
+| App | 1.4.0 (version code 5) |
 | Media3 | 1.10.1 |
 | compile SDK | 36 |
 | target SDK | 34 |
@@ -81,6 +82,13 @@ adb devices -l
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb shell am start -n app.nogarbo.leflac/.MainActivity
 ```
+
+On the current Gradle/Android runner, `connectedDebugAndroidTest` can uninstall
+the target app during teardown even after a successful run. Treat that command
+as destructive to app-local state: use a disposable device or confirm Android
+backup first, then reinstall the release APK and verify permissions. To retain
+the target install, assemble/install the test APK manually and invoke the
+required class with `adb shell am instrument` instead of the aggregate task.
 
 `adb install -r` upgrades in place and preserves the app's preferences, play
 history, and analysis cache only when the installed and replacement APKs use
@@ -169,6 +177,12 @@ Run every item while parked unless it explicitly tests an interruption:
 - **Priority queue:** phone long-press selection commits A then B as
   `CURRENT → A → B → ORDER/RNG`; rail changes preserve A/B, removal and clear
   update the car's standard queue, and a play-now selection clears the schedule.
+- **Effective-future ledger:** before any manual hold, `NEXT nn` is pre-filled
+  with `RAIL` rows. Remove one generated repeated occurrence with its `[X]` and
+  verify only that occurrence disappears.
+- **Held controls:** with A then B held, `[CLR HELD]` removes A/B while leaving
+  the generated rail intact; switching ORDER/RNG rebuilds the rail without
+  losing A/B or changing their priority.
 - **Visuals:** POCKET is the fresh-install default; FIELD is selectable; text
   and host-tinted icons remain readable in day and night modes.
 - **Existing app:** phone FIELD/POCKET behavior, smart queues, local analysis,

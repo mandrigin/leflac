@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.4.0 — 2026-07-19 — Training profiles, live queue, mix heat
+
+- Replaced the single flat/loud gym heuristic with activity-aware CARDIO,
+  WEIGHTS, GRIT, and STATIC profiles. `.gym` now has a visible selector and
+  each mode also works as a direct deck command (including `.grift` as a
+  forgiving alias for `.grit`).
+- Added a tappable, upward-opening result layer to SCAN so the keyboard cannot
+  cover command or song/mix matches. Typing `.` lists canonical deck commands,
+  partial prefixes filter them, and aliases resolve to the uncluttered entry.
+- Repaired JNI FFT input aliasing, stereo downmix, per-window timestamps, tempo
+  confidence, pulse/transient extraction, and profile cache invalidation. Gym
+  results update as background analysis completes instead of depending on when
+  the command was entered.
+- Made workout eligibility deterministic and shared between search and
+  playback. Listening history is now only an 8% ranking tie-breaker; small
+  qualified sets remain small and never fall back to arbitrary songs.
+- Kept CARDIO/WEIGHTS/GRIT/STATIC sessions inside their qualified song set
+  across ORDER/RNG changes and file-level NEXT/PREV, with the active profile
+  engraved in the system strip.
+- Expanded the `NEXT nn` ledger from manual picks to the effective Media3
+  future: HELD priority items plus the generated ORDER/RNG rail. Every visible
+  occurrence has an exact remove control; `[CLR HELD]` remains lossless and
+  leaves the generated rail intact.
+- Added stable per-occurrence queue identities and a truthful projection that
+  hides the temporary natural duplicate of a promoted track while retaining
+  intentional RNG repeats.
+- Added persisted, cue-bounded listening heat for long mixes. A normal pass is
+  neutral; replayed or deliberately revisited segments become HOT, appear as
+  jump targets in the cue ladder, and are painted on the scrubber heat map.
+- Tightened mix cue extraction to final/near-final analysis, local novelty
+  peaks, and a robust significance gate so listening history is not attached
+  to arbitrary noise partitions.
+- Added unit coverage for workout modes/features, queue projection and repeat
+  identity, cue sanitation/boundaries, hot-segment qualification, batched
+  listening, and lossless cue-map rebinding, plus device persistence coverage
+  for provisional-to-final mix heat migration.
+
 ## 1.3.0 — 2026-07-13 — UX consistency pass
 
 - Rechecked Music and audio permission on every Activity resume so returning

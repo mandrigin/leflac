@@ -23,6 +23,11 @@ import androidx.media3.session.SessionError
 import app.nogarbo.leflac.MainActivity
 import app.nogarbo.leflac.data.AndroidAutoVisualScheme
 import app.nogarbo.leflac.data.LocalAudioLibrary
+import app.nogarbo.leflac.data.MixSegmentListeningRecord
+import app.nogarbo.leflac.data.MixSegmentStore
+import app.nogarbo.leflac.data.addMixSegmentListening
+import app.nogarbo.leflac.data.calculateMixSegmentHeat
+import app.nogarbo.leflac.data.mixSegmentIndexAt
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.Futures
@@ -58,6 +63,12 @@ class AudioService : MediaLibraryService() {
     private var lastStatsTickMs = android.os.SystemClock.elapsedRealtime()
     private var pendingMixResumeId: String? = null
     private var lastMixPositionSaveMs = 0L
+    private var activeMixHeatMediaId: String? = null
+    private var activeMixHeatDurationMs = 0L
+    private var activeMixHeatCuePoints = emptyList<Long>()
+    private var activeMixHeatRecord: MixSegmentListeningRecord? = null
+    private val pendingMixHeatMs = mutableMapOf<Int, Long>()
+    private var lastMixHeatFlushMs = android.os.SystemClock.elapsedRealtime()
     private var pruningConsumedUpNext = false
     private val prunedUpNextTokens = mutableSetOf<String>()
     private val queueGeneration = AtomicLong(0L)
@@ -109,6 +120,7 @@ class AudioService : MediaLibraryService() {
         player.addListener(object : androidx.media3.common.Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 PlaybackBus.isPlaying.value = isPlaying
+                if (!isPlaying) flushMixSegmentHeat()
                 persistPlaybackState()
             }
 
@@ -123,6 +135,7 @@ class AudioService : MediaLibraryService() {
                         nextMediaId == trackedMediaId
                 if (!metadataOnlyRefresh) {
                     settleTrackedPlay()
+                    clearActiveMixSegmentHeat(nextMediaId)
                     trackedMediaId = nextMediaId
                     trackedDurationMs = player.duration.coerceAtLeast(0L)
                     pendingMixResumeId = nextMediaId
@@ -136,6 +149,7 @@ class AudioService : MediaLibraryService() {
                 if (playbackState == Player.STATE_READY) {
                     trackedDurationMs = player.duration.coerceAtLeast(0L)
                     maybeResumeMix()
+                    ensureMixSegmentHeatState()
                 } else if (playbackState == Player.STATE_ENDED) {
                     settleTrackedPlay()
                 }
@@ -237,6 +251,22 @@ class AudioService : MediaLibraryService() {
         localLibrary.invalidate()
     }
 
+    /** Installs the final analysis cue map without making UI lifecycle own stats. */
+    fun installMixCueMap(mediaId: String, durationMs: Long, cuePoints: List<Long>) {
+        if (mediaId.isBlank() ||
+            durationMs < app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS
+        ) return
+        flushMixSegmentHeat()
+        val updated = MixSegmentStore.updateCueMap(this, mediaId, durationMs, cuePoints) ?: return
+        if (::player.isInitialized && player.currentMediaItem?.mediaId == mediaId) {
+            activeMixHeatMediaId = mediaId
+            activeMixHeatDurationMs = durationMs
+            activeMixHeatCuePoints = updated.cuePointsMs
+            activeMixHeatRecord = updated
+            publishMixSegmentHeat()
+        }
+    }
+
     private fun notifyLibraryContentChanged() {
         if (libraryExecutor.isShutdown) return
         libraryExecutor.execute {
@@ -306,7 +336,7 @@ class AudioService : MediaLibraryService() {
 
     private fun publishUpNext() {
         if (!::player.isInitialized) return
-        PlaybackBus.upNext.value = UpNextQueue.pendingEntries(player)
+        PlaybackBus.upNext.value = UpNextQueue.effectiveEntries(player)
     }
 
     /**
@@ -407,7 +437,7 @@ class AudioService : MediaLibraryService() {
                 }
             }
             val items = persisted.mapIndexed { index, track ->
-                val item = autoLibrary.playbackItem(track)
+                val item = UpNextQueue.identify(autoLibrary.playbackItem(track))
                 if (index in markedIndices) UpNextQueue.mark(item) else item
             }
             return items to 0
@@ -420,7 +450,8 @@ class AudioService : MediaLibraryService() {
             if (track.queuePool() != pool) return@mapNotNull null
             UpNextQueue.mark(autoLibrary.playbackItem(track))
         }
-        return insertPriorityAfterCurrent(base.first, base.second, restored) to base.second
+        val identifiedBase = base.first.map { UpNextQueue.identify(it) }
+        return insertPriorityAfterCurrent(identifiedBase, base.second, restored) to base.second
     }
 
     private fun restoreTimelineWithoutAutoplay() {
@@ -469,7 +500,118 @@ class AudioService : MediaLibraryService() {
             app.nogarbo.leflac.data.PlayStatsStore.savePosition(this, mediaId, position)
         }
 
+        if (mediaId != null &&
+            duration >= app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS
+        ) {
+            recordMixSegmentListening(mediaId, duration, position, delta, now)
+        }
+
         if (now % 5_000L < 1_000L) persistPlaybackState()
+    }
+
+    private fun ensureMixSegmentHeatState() {
+        if (!::player.isInitialized) return
+        val mediaId = player.currentMediaItem?.mediaId ?: return
+        val duration = player.duration.coerceAtLeast(0L)
+        if (duration < app.nogarbo.leflac.data.LocalAudioLibrarySnapshot.MIX_DURATION_THRESHOLD_MS) {
+            clearActiveMixSegmentHeat(mediaId)
+            return
+        }
+        if (activeMixHeatMediaId == mediaId && activeMixHeatDurationMs == duration &&
+            activeMixHeatRecord != null
+        ) return
+
+        flushMixSegmentHeat()
+        val existing = MixSegmentStore.get(this, mediaId)
+        val provisional = existing == null || existing.isProvisional
+        val cues = if (provisional) provisionalMixCuePoints(duration) else existing.cuePointsMs
+        val aligned = MixSegmentStore.updateCueMap(
+            context = this,
+            mediaId = mediaId,
+            durationMs = duration,
+            cuePointsMs = cues,
+            isProvisional = provisional
+        ) ?: return
+        activeMixHeatMediaId = mediaId
+        activeMixHeatDurationMs = duration
+        activeMixHeatCuePoints = aligned.cuePointsMs
+        activeMixHeatRecord = aligned
+        pendingMixHeatMs.clear()
+        lastMixHeatFlushMs = android.os.SystemClock.elapsedRealtime()
+        publishMixSegmentHeat()
+    }
+
+    private fun recordMixSegmentListening(
+        mediaId: String,
+        durationMs: Long,
+        positionMs: Long,
+        deltaMs: Long,
+        elapsedNowMs: Long
+    ) {
+        if (deltaMs <= 0L) return
+        if (activeMixHeatMediaId != mediaId || activeMixHeatDurationMs != durationMs ||
+            activeMixHeatRecord == null
+        ) {
+            ensureMixSegmentHeatState()
+        }
+        if (activeMixHeatMediaId != mediaId) return
+        val segment = mixSegmentIndexAt(durationMs, activeMixHeatCuePoints, positionMs)
+        if (segment < 0) return
+        val oldPending = pendingMixHeatMs[segment] ?: 0L
+        pendingMixHeatMs[segment] = (oldPending + deltaMs).coerceAtLeast(oldPending)
+        activeMixHeatRecord = addMixSegmentListening(
+            record = activeMixHeatRecord,
+            durationMs = durationMs,
+            cuePointsMs = activeMixHeatCuePoints,
+            deltasBySegment = mapOf(segment to deltaMs)
+        )
+        publishMixSegmentHeat()
+        if (elapsedNowMs - lastMixHeatFlushMs >= 15_000L) flushMixSegmentHeat()
+    }
+
+    private fun flushMixSegmentHeat() {
+        val mediaId = activeMixHeatMediaId ?: return
+        if (pendingMixHeatMs.isEmpty()) return
+        val saved = MixSegmentStore.addListening(
+            context = this,
+            mediaId = mediaId,
+            durationMs = activeMixHeatDurationMs,
+            cuePointsMs = activeMixHeatCuePoints,
+            deltasBySegment = pendingMixHeatMs.toMap()
+        )
+        pendingMixHeatMs.clear()
+        if (saved != null) activeMixHeatRecord = saved
+        lastMixHeatFlushMs = android.os.SystemClock.elapsedRealtime()
+        publishMixSegmentHeat()
+    }
+
+    private fun publishMixSegmentHeat() {
+        val record = activeMixHeatRecord
+        PlaybackBus.mixHeat.value = if (record == null || record.isProvisional) {
+            MixHeatSnapshot(mediaId = activeMixHeatMediaId)
+        } else {
+            MixHeatSnapshot(
+                mediaId = activeMixHeatMediaId,
+                segments = calculateMixSegmentHeat(record)
+            )
+        }
+    }
+
+    private fun clearActiveMixSegmentHeat(nextMediaId: String?) {
+        pendingMixHeatMs.clear()
+        activeMixHeatMediaId = null
+        activeMixHeatDurationMs = 0L
+        activeMixHeatCuePoints = emptyList()
+        activeMixHeatRecord = null
+        PlaybackBus.mixHeat.value = MixHeatSnapshot(mediaId = nextMediaId)
+    }
+
+    private fun provisionalMixCuePoints(durationMs: Long): List<Long> {
+        val bucketMs = 30_000L
+        if (durationMs <= bucketMs) return emptyList()
+        return generateSequence(bucketMs) { previous ->
+            (previous + bucketMs).takeIf { it < durationMs }
+        }.toList()
     }
 
     private fun maybeResumeMix() {
@@ -485,6 +627,7 @@ class AudioService : MediaLibraryService() {
     }
 
     private fun settleTrackedPlay() {
+        flushMixSegmentHeat()
         val mediaId = trackedMediaId
         val duration = trackedDurationMs
         val listened = trackedListenedMs
@@ -685,7 +828,7 @@ class AudioService : MediaLibraryService() {
                             throw IllegalStateException("Playback queue context changed")
                         }
                         return@submit MediaSession.MediaItemsWithStartPosition(
-                            queue,
+                            queue.map { UpNextQueue.identify(it) },
                             selectedIndex,
                             startPositionMs
                         )
@@ -834,7 +977,7 @@ class AudioService : MediaLibraryService() {
                 items.forEach { item ->
                     val pool = mediaItemPool(item, snapshot) ?: return@forEach
                     if (targetPool == null) targetPool = pool
-                    if (pool == targetPool) add(withCarArtwork(item))
+                    if (pool == targetPool) add(UpNextQueue.identify(withCarArtwork(item)))
                 }
             }
         }
@@ -864,11 +1007,13 @@ class AudioService : MediaLibraryService() {
                         durations?.getOrNull(index)?.takeIf { it >= 0L }?.let(metadataBuilder::setDurationMs)
                         val metadata = metadataBuilder.build()
                             
-                        MediaItem.Builder()
-                            .setUri(uri)
-                            .setMediaId(uri.toString())
-                            .setMediaMetadata(metadata)
-                            .build()
+                        UpNextQueue.identify(
+                            MediaItem.Builder()
+                                .setUri(uri)
+                                .setMediaId(uri.toString())
+                                .setMediaMetadata(metadata)
+                                .build()
+                        )
                     }
                     player.setMediaItems(mediaItems)
                     player.seekTo(startIndex, 0L)

@@ -9,9 +9,9 @@ LE FLAC is a local-only music player that behaves like a piece of field
 equipment: it analyses every track it touches, knows where the drops are
 before they arrive, keeps a clock on its sleep screen, prints its manual
 and its own circuit diagram on the back of the chassis, and runs a 25×25
-LED cassette deck on the Glyph Matrix. LF-1 1.3 is also a projected, browsable
-Android Auto media source and adds a persistent, explicit UP NEXT bus without
-adding a network permission.
+LED cassette deck on the Glyph Matrix. LF-1 1.4 is also a projected, browsable
+Android Auto media source, exposes its real playback future, learns cue-level
+mix heat, and does all of it without adding a network permission.
 
 <p align="center">
   <img src="docs/faceplate-song.png" width="300" alt="FIELD skin — a song on the deck">
@@ -41,8 +41,8 @@ had it.
 | FORMATS | FLAC · MP3 · AAC · OGG · WAV (16-44 → 24-192) |
 | SKINS | FIELD (chassis beige · safety orange · cyan) · POCKET (2-bit 1989-handheld LCD, Bayer-dithered, no alpha anywhere) |
 | MATRIX | 25×25 Glyph: turntable, cassette, sleeping ampelmann, punch-in shutter, plate clock |
-| ANALYSIS | full-track FFT at import · epic-segment detection · cue extraction · BPM · drive profiling |
-| MEMORY | play/skip stats with 45-day half-life · persistent FIFO UP NEXT · mix resume positions · lifetime runtime, etched on the chassis |
+| ANALYSIS | full-track FFT at import · epic segments · cue extraction · tempo confidence · four workout profiles |
+| MEMORY | 45-day play/skip heat · persistent effective queue · cue-level mix heat · mix resume · lifetime runtime |
 | CAR DECK | Android Auto browse · host voice requests · resume · steering-wheel transport · POCKET artwork by default, FIELD selectable |
 | DISPLAY DRIVER | AGSL CRT raster: scanline tear, phosphor lines, periodic magnet pass with degauss snap-back |
 | REQUIRES | Android 14+ · a Nothing Phone (3) for the Matrix · a compatible Android Auto host for the car deck |
@@ -89,9 +89,12 @@ Every track is decoded once and analysed offline. From that single pass:
   peaks. While a mix plays, the faceplate prints a cue ladder (tap a row
   to jump the tape), the transport buttons become CUE−/CUE+, and the
   system strip counts cues instead of advertising the Glyph.
-- **Drive profiles** — mean kick density, flatness, tempo. The drama
-  detector's reject pile ("loud all the time means loud is not special")
-  turns out to be the perfect gym playlist. We kept the reject pile.
+- **Training profiles** — pulse, tempo confidence, low-end impact, transients,
+  sustained drive, stability, and aggression. CARDIO, WEIGHTS, GRIT, and
+  STATIC use different evidence instead of pretending one gym score fits all.
+- **Mix heat** — cue-bounded listening exposure. Playing a mix through once is
+  neutral; segments you replay or deliberately revisit become HOT jump targets
+  and light up on the tape rail.
 
 ## TWO RAILS
 
@@ -105,7 +108,9 @@ jump — a real button, never a mode.
 
 **UP NEXT outranks both rails.** Hold a track to open the loader, tap more
 tracks in the order you want them, then press `[QUEUE]`. The `NEXT nn` ledger
-tab shows the FIFO priority bus and provides per-item remove and clear controls.
+tab shows the complete effective future: HELD priority first, then the generated
+ORDER/RNG rail. Every occurrence can be removed; `[CLR HELD]` removes only your
+explicit picks and leaves the rail intact.
 Normal track taps still mean play now. A play-now selection starts a new
 context and clears the previous explicit schedule; changing ORDER/RNG preserves
 it. Song and mix pools remain separate. The exact behavior and edge cases are
@@ -125,13 +130,25 @@ verbs (`.` or `>` — the dot needs no keyboard switch):
 
 ```
 .hot     your current heat
-.gym     the training set — drive × tempo × your own heat. heat wins.
+.gym     training selector — CARDIO · WEIGHTS · GRIT · STATIC
+.cardio  steady pulse and tempo for endurance work
+.weights impact, transients, and contrast for lifting
+.grit    aggressive sustained drive (.grift is accepted too)
+.static  stable, lower-jolt focus for holds and mobility
 .mix     every cassette
 .rng     ten at random
 ```
 
-Playing from `.gym` starts a **gym session**: the queue locks to the
-training pool until you tap `[GYM · TAP TO END]` in the system strip.
+Type `.` to open the command layer; it narrows as you continue (`.g` shows
+`.gym` and `.grit`). While the keyboard is open, both command suggestions and
+song/mix matches rise above SCAN instead of being hidden below it. Tap a
+suggestion to run it. Accepted aliases still resolve to their canonical command
+without cluttering the list.
+
+Playing from a training result starts a named **workout session**: the queue
+locks to that qualified profile until you tap its `[CARDIO/WEIGHTS/GRIT/STATIC
+· END]` engraving in the system strip. Personal heat breaks close ranking ties
+but can no longer turn an unsuitable track into a workout match.
 
 ## THE GLYPH TOY
 
@@ -232,13 +249,13 @@ make build                  # assemble the APK
 scripts/push_music.sh DIR   # push a folder of music to the device
 ```
 
-The final v1.3 sideload build is attached to the
-[v1.3.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.3.0).
+The latest phone-accepted sideload build is attached to the
+[v1.4.0 GitHub release](https://github.com/mandrigin/leflac/releases/tag/v1.4.0).
 The exact release asset was installed on the Nothing A024 and pulled back with
 the same SHA-256 recorded in the release notes.
 That APK uses the development/debug signing key and is intended for direct
 testing, not store distribution. Upgrade preservation requires the installed
-copy to use the same signing key. Version 1.3.0 uses Media3 1.10.1 and API 36
+copy to use the same signing key. Version 1.4.0 uses Media3 1.10.1 and API 36
 build tooling while retaining target SDK 34 for sideloaded Android Auto
 compatibility. It needs a local
 music library (it scans MediaStore) and, for the full experience, a

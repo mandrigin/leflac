@@ -33,6 +33,7 @@ fun FieldScrubber(
     history: List<app.nogarbo.leflac.ui.viewmodel.PlaybackViewModel.SpectralPoint> = emptyList(),
     fullTimeline: List<app.nogarbo.leflac.ui.viewmodel.PlaybackViewModel.SpectralPoint> = emptyList(),
     cuePoints: List<Long> = emptyList(),
+    hotSegments: List<app.nogarbo.leflac.data.MixSegmentHeat> = emptyList(),
     onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -89,6 +90,19 @@ fun FieldScrubber(
                 topLeft = Offset(0f, centerY - barHeight / 2),
                 size = Size(width, barHeight)
             )
+
+            // Learned mix heat: a quiet band behind replayed cue intervals.
+            if (duration > 0L) {
+                hotSegments.forEach { segment ->
+                    val startX = width * (segment.startMs.toFloat() / duration).coerceIn(0f, 1f)
+                    val endX = width * (segment.endMs.toFloat() / duration).coerceIn(0f, 1f)
+                    drawRect(
+                        color = if (skin.isLcd) skin.shadeMid else skin.rng.copy(alpha = 0.22f),
+                        topLeft = Offset(startX, centerY - barHeight * 1.5f),
+                        size = Size((endX - startX).coerceAtLeast(2f), barHeight * 3f)
+                    )
+                }
+            }
 
             // 1.5 CMYK Spectrogram (Intense)
             // DECISION: Full Timeline vs History
@@ -215,11 +229,13 @@ fun FieldScrubber(
             if (duration > 0 && cuePoints.isNotEmpty()) {
                 for (cue in cuePoints) {
                     val cx = width * (cue.toFloat() / duration).coerceIn(0f, 1f)
+                    val isHotStart = hotSegments.any { it.startMs == cue }
                     drawLine(
-                        color = skin.accent.copy(alpha = if (skin.isLcd) 1f else 0.7f),
+                        color = if (isHotStart) skin.rng else
+                            skin.accent.copy(alpha = if (skin.isLcd) 1f else 0.7f),
                         start = Offset(cx, centerY - barHeight * 2.5f),
                         end = Offset(cx, centerY - barHeight / 2),
-                        strokeWidth = 2f
+                        strokeWidth = if (isHotStart) 4f else 2f
                     )
                 }
             }
@@ -321,7 +337,9 @@ fun FieldScrubber(
                 .semantics {
                     contentDescription = "Playback position"
                     stateDescription = if (duration > 0L) {
-                        "$timeString of $totalTimeString"
+                        "$timeString of $totalTimeString" + if (hotSegments.isNotEmpty()) {
+                            ", ${hotSegments.size} hot ${if (hotSegments.size == 1) "segment" else "segments"}"
+                        } else ""
                     } else {
                         "No track loaded"
                     }

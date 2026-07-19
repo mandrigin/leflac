@@ -19,8 +19,14 @@ data class UpNextEntry(
     val mediaId: String,
     val title: String,
     val artist: String,
-    val durationMs: Long
+    val durationMs: Long,
+    val origin: QueueEntryOrigin = QueueEntryOrigin.MANUAL
 )
+
+enum class QueueEntryOrigin {
+    MANUAL,
+    GENERATED
+}
 
 enum class ScheduleUpNextResult {
     ADDED,
@@ -52,27 +58,41 @@ fun playbackPool(allTracks: List<AudioTrack>, selected: AudioTrack): List<AudioT
     return allTracks.filter { it.queuePool() == pool }
 }
 
-fun AudioTrack.toPlaybackMediaItem(): MediaItem = MediaItem.Builder()
-    .setMediaId(uri.toString())
-    .setUri(uri)
-    .setMimeType(mimeType)
-    .setMediaMetadata(
-        MediaMetadata.Builder()
-            .setTitle(title)
-            .setArtist(artist)
-            .setAlbumTitle(folderName)
-            .setDurationMs(duration)
-            .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
-            .setIsBrowsable(false)
-            .setIsPlayable(true)
-            .build()
-    )
-    .build()
+fun AudioTrack.toPlaybackMediaItem(): MediaItem = UpNextQueue.identify(
+    MediaItem.Builder()
+        .setMediaId(uri.toString())
+        .setUri(uri)
+        .setMimeType(mimeType)
+        .setMediaMetadata(
+            MediaMetadata.Builder()
+                .setTitle(title)
+                .setArtist(artist)
+                .setAlbumTitle(folderName)
+                .setDurationMs(duration)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .setIsBrowsable(false)
+                .setIsPlayable(true)
+                .build()
+        )
+        .build()
+)
 
 object UpNextQueue {
     private const val EXTRA_QUEUE_ORIGIN = "app.nogarbo.leflac.queue_origin"
     private const val EXTRA_QUEUE_TOKEN = "app.nogarbo.leflac.queue_token"
     private const val ORIGIN_UP_NEXT = "up_next"
+
+    /** Gives one physical timeline occurrence a stable identity without making it manual. */
+    fun identify(mediaItem: MediaItem, occurrenceId: String = UUID.randomUUID().toString()): MediaItem {
+        if (!entryId(mediaItem).isNullOrBlank()) return mediaItem
+        val extras = Bundle(mediaItem.mediaMetadata.extras ?: Bundle.EMPTY).apply {
+            putString(EXTRA_QUEUE_TOKEN, occurrenceId)
+        }
+        val metadata = mediaItem.mediaMetadata.buildUpon()
+            .setExtras(extras)
+            .build()
+        return mediaItem.buildUpon().setMediaMetadata(metadata).build()
+    }
 
     fun mark(mediaItem: MediaItem, entryId: String = UUID.randomUUID().toString()): MediaItem {
         val extras = Bundle(mediaItem.mediaMetadata.extras ?: Bundle.EMPTY).apply {
@@ -91,6 +111,10 @@ object UpNextQueue {
     fun entryId(mediaItem: MediaItem): String? =
         mediaItem.mediaMetadata.extras?.getString(EXTRA_QUEUE_TOKEN)
 
+    /** Exact identity for a published snapshot, including legacy un-tokened items. */
+    fun occurrenceId(mediaItem: MediaItem, timelineIndex: Int): String =
+        entryId(mediaItem) ?: "timeline-$timelineIndex-${mediaItem.mediaId}"
+
     fun pendingIndices(player: Player): List<Int> {
         val flags = (0 until player.mediaItemCount).map { index ->
             isMarked(player.getMediaItemAt(index))
@@ -103,15 +127,44 @@ object UpNextQueue {
 
     fun pendingEntries(player: Player): List<UpNextEntry> =
         pendingIndices(player).map { index ->
-            val item = player.getMediaItemAt(index)
-            UpNextEntry(
-                entryId = entryId(item) ?: "queue-$index-${item.mediaId}",
-                mediaId = item.mediaId,
-                title = item.mediaMetadata.title?.toString().orEmpty().ifBlank { "Unknown track" },
-                artist = item.mediaMetadata.artist?.toString().orEmpty().ifBlank { "Unknown artist" },
-                durationMs = item.mediaMetadata.durationMs ?: C.TIME_UNSET
+            entry(player.getMediaItemAt(index), index, QueueEntryOrigin.MANUAL)
+        }
+
+    /**
+     * The queue the listener will actually hear after the current item. A manual
+     * promotion leaves its natural rail occurrence in the physical timeline
+     * until it is consumed, so the projection hides that one future duplicate.
+     */
+    fun effectiveEntries(player: Player): List<UpNextEntry> {
+        val items = (0 until player.mediaItemCount).map(player::getMediaItemAt)
+        val marked = items.map(::isMarked)
+        return effectiveFutureIndices(
+            currentIndex = player.currentMediaItemIndex,
+            timelineIds = items.map(MediaItem::mediaId),
+            marked = marked
+        ).map { index ->
+            entry(
+                mediaItem = items[index],
+                timelineIndex = index,
+                origin = if (marked[index]) QueueEntryOrigin.MANUAL else QueueEntryOrigin.GENERATED
             )
         }
+    }
+
+    private fun entry(
+        mediaItem: MediaItem,
+        timelineIndex: Int,
+        origin: QueueEntryOrigin
+    ): UpNextEntry = UpNextEntry(
+        // All app/service construction paths identify occurrences. The guarded
+        // legacy key remains exact within this published timeline snapshot.
+        entryId = occurrenceId(mediaItem, timelineIndex),
+        mediaId = mediaItem.mediaId,
+        title = mediaItem.mediaMetadata.title?.toString().orEmpty().ifBlank { "Unknown track" },
+        artist = mediaItem.mediaMetadata.artist?.toString().orEmpty().ifBlank { "Unknown artist" },
+        durationMs = mediaItem.mediaMetadata.durationMs ?: C.TIME_UNSET,
+        origin = origin
+    )
 }
 
 internal fun upNextInsertionIndex(currentIndex: Int, marked: List<Boolean>): Int {
@@ -124,6 +177,35 @@ internal fun upNextInsertionIndex(currentIndex: Int, marked: List<Boolean>): Int
 internal fun upNextPendingIndices(currentIndex: Int, marked: List<Boolean>): List<Int> {
     val start = if (currentIndex == C.INDEX_UNSET) 0 else (currentIndex + 1).coerceIn(0, marked.size)
     return (start until marked.size).filter { marked[it] }
+}
+
+/**
+ * Projects the physical timeline into effective playback order. For every
+ * pending marked promotion, claim and hide the first later unmarked occurrence
+ * with the same media ID. Any additional repeats remain visible.
+ */
+internal fun effectiveFutureIndices(
+    currentIndex: Int,
+    timelineIds: List<String>,
+    marked: List<Boolean>
+): List<Int> {
+    require(timelineIds.size == marked.size)
+    val start = if (currentIndex == C.INDEX_UNSET) {
+        0
+    } else {
+        (currentIndex + 1).coerceIn(0, timelineIds.size)
+    }
+    val hiddenNaturalDuplicates = mutableSetOf<Int>()
+    for (markedIndex in start until timelineIds.size) {
+        if (!marked[markedIndex]) continue
+        val duplicateIndex = ((markedIndex + 1) until timelineIds.size).firstOrNull { index ->
+            index !in hiddenNaturalDuplicates &&
+                !marked[index] &&
+                timelineIds[index] == timelineIds[markedIndex]
+        }
+        if (duplicateIndex != null) hiddenNaturalDuplicates += duplicateIndex
+    }
+    return (start until timelineIds.size).filterNot(hiddenNaturalDuplicates::contains)
 }
 
 internal data class PlannedUpNextItem(
